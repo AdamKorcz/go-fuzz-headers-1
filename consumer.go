@@ -166,6 +166,19 @@ func (f *ConsumeFuzzer) fuzzStruct(e reflect.Value, customFunctions bool) error 
 	case reflect.Struct:
 		for i := 0; i < e.NumField(); i++ {
 			var v reflect.Value
+
+			// Check if field is optional
+			jsonTag := e.Type().Field(i).Tag.Get("json")
+			if strings.Contains(jsonTag, ",omitempty") {
+				// field is optional
+				shouldSkip, err := f.GetBool()
+				if err != nil {
+					return err
+				}
+				if shouldSkip {
+					continue
+				}
+			}
 			if !e.Field(i).CanSet() {
 				if f.fuzzUnexportedFields {
 					v = reflect.NewAt(e.Field(i).Type(), unsafe.Pointer(e.Field(i).UnsafeAddr())).Elem()
