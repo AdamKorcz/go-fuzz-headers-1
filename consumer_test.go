@@ -19,6 +19,7 @@ import (
 	//"bytes"
 	//"io"
 	"testing"
+	corev1 "k8s.io/api/core/v1"
 )
 
 type TestStruct1 struct {
@@ -224,4 +225,16 @@ func TestGeBytes3(t *testing.T) {
 			t.Fatalf("b[%d] should be 0x00 but is %v\n", i, b[i])
 		}
 	}
+}
+
+func TestGeneratePod(t *testing.T) {
+	pod := &corev1.Pod{}
+	data := []byte{0x01,0x00,0x00,0x00,0x03,0x50,0x06f,0x064, // "Kind: Pod"
+	               0x01,0x00,0x00,0x00,0x02,0x76,0x31, // "APIVersion: v1"
+	               0x00, // Skip ObjectMeta
+	               0x01, // Do not skip Spec
+	           }
+	ff := NewConsumer(data)
+	ff.GenerateStruct(pod)
+	t.Log(pod)
 }

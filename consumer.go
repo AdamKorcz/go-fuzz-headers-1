@@ -161,20 +161,23 @@ func (f *ConsumeFuzzer) fuzzStruct(e reflect.Value, customFunctions bool) error 
 			return err
 		}
 	}
-
+	fmt.Println("HEere1")
 	switch e.Kind() {
 	case reflect.Struct:
 		for i := 0; i < e.NumField(); i++ {
+			fmt.Println(e.Type().Field(i).Name)
 			var v reflect.Value
 
 			// Check if field is optional
 			jsonTag := e.Type().Field(i).Tag.Get("json")
 			if strings.Contains(jsonTag, ",omitempty") {
 				// field is optional
+				fmt.Println("Checking whether optional")
 				shouldSkip, err := f.GetBool()
 				if err != nil {
 					return err
 				}
+				fmt.Println("shouldSkip: ", shouldSkip)
 				if shouldSkip {
 					continue
 				}
@@ -194,6 +197,7 @@ func (f *ConsumeFuzzer) fuzzStruct(e reflect.Value, customFunctions bool) error 
 			}
 		}
 	case reflect.String:
+		fmt.Println("In GetString")
 		str, err := f.GetString()
 		if err != nil {
 			return err
@@ -390,13 +394,6 @@ func (f *ConsumeFuzzer) GetUint16() (uint16, error) {
 	if err != nil {
 		return 0, err
 	}
-	littleEndian, err := f.GetBool()
-	if err != nil {
-		return 0, err
-	}
-	if littleEndian {
-		return binary.LittleEndian.Uint16(u16), nil
-	}
 	return binary.BigEndian.Uint16(u16), nil
 }
 
@@ -412,13 +409,6 @@ func (f *ConsumeFuzzer) GetUint64() (uint64, error) {
 	u64, err := f.GetNBytes(8)
 	if err != nil {
 		return 0, err
-	}
-	littleEndian, err := f.GetBool()
-	if err != nil {
-		return 0, err
-	}
-	if littleEndian {
-		return binary.LittleEndian.Uint64(u64), nil
 	}
 	return binary.BigEndian.Uint64(u64), nil
 }
@@ -456,10 +446,12 @@ func (f *ConsumeFuzzer) GetString() (string, error) {
 	if f.position >= f.dataTotal {
 		return "nil", errors.New("not enough bytes to create string")
 	}
+	fmt.Println("f.position:", f.position)
 	length, err := f.GetUint32()
 	if err != nil {
 		return "nil", errors.New("not enough bytes to create string")
 	}
+	fmt.Println("length: ", length)
 	if f.position > MaxTotalLen {
 		return "nil", errors.New("created too large a string")
 	}
@@ -474,6 +466,7 @@ func (f *ConsumeFuzzer) GetString() (string, error) {
 		return "nil", errors.New("numbers overflow")
 	}
 	f.position = byteBegin + length
+	fmt.Println(string(f.data[byteBegin:f.position]))
 	return string(f.data[byteBegin:f.position]), nil
 }
 
