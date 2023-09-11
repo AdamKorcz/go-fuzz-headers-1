@@ -3,6 +3,7 @@ package gofuzzheaders
 import (
 	"fmt"
 	"strings"
+	"os"
 	"testing"
 	corev1 "k8s.io/api/core/v1"
 )
@@ -11,8 +12,8 @@ func TestGenerateSeed(t *testing.T) {
 	pod := &corev1.Pod{}
 	c := NewSeedGenerator()
 	s := c.GenerateSeed(pod)
-	f := NewConsumer(s)
-	f.GenerateStruct(pod)
+	ff := NewConsumer(s)
+	ff.GenerateStruct(pod)
 	//t.Log(err)
 	t.Logf("%+v\n", pod.TypeMeta.Kind)
 	t.Logf("%+v\n", pod.TypeMeta.APIVersion)
@@ -31,14 +32,19 @@ func TestGenerateSeed(t *testing.T) {
 	t.Logf("Containers: %+v\n", pod.Spec.Containers)
 	//t.Logf("len(pod.Spec.Containers): %d", len(pod.Spec.Containers))
 	var sw strings.Builder
-	for i, b := range s {
-		if i > 1000 {
-			break
-		}
-		sw.WriteString(fmt.Sprintf("0x%X, ", b))
+	for _, b := range s {
+		sw.WriteString(fmt.Sprintf("0x%X ", b))
 	}
 	//t.Log(s[0:2000])
 	t.Log(len(sw.String()))
+
+	// creates a seed file:
+	f, err := os.Create("seed1")
+	if err != nil {
+		panic(err)
+	}
+	defer f.Close()
+	f.WriteString(sw.String())
 	t.Fatal("Done")
 }
 
