@@ -4,7 +4,7 @@ import (
 	"bytes"
 	//"fmt"
 	"reflect"
-	"unsafe"
+	//"unsafe"
 	"strings"
 )
 
@@ -57,7 +57,6 @@ func (f *SeedGenerator) fuzzStruct(e reflect.Value, customFunctions bool) error 
 			}
 
 			if !e.Field(i).CanSet() {
-					v = reflect.NewAt(e.Field(i).Type(), unsafe.Pointer(e.Field(i).UnsafeAddr())).Elem()
 				if err := f.fuzzStruct(v, customFunctions); err != nil {
 					return err
 				}
