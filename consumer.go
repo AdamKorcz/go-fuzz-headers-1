@@ -62,6 +62,7 @@ func NewConsumer(fuzzData []byte) *ConsumeFuzzer {
 		dataTotal: uint32(len(fuzzData)),
 		Funcs:     make(map[reflect.Type]reflect.Value),
 		curDepth:  0,
+		position: uint32(0),
 	}
 }
 
@@ -161,24 +162,28 @@ func (f *ConsumeFuzzer) fuzzStruct(e reflect.Value, customFunctions bool) error 
 			return err
 		}
 	}
-	fmt.Println("HEere1")
+	//fmt.Println("HEere1")
 	switch e.Kind() {
 	case reflect.Struct:
 		for i := 0; i < e.NumField(); i++ {
-			fmt.Println(e.Type().Field(i).Name)
 			var v reflect.Value
+			//fmt.Printf("%s: ", e.Type().Field(i).Name)
 
 			// Check if field is optional
 			jsonTag := e.Type().Field(i).Tag.Get("json")
 			if strings.Contains(jsonTag, ",omitempty") {
 				// field is optional
-				fmt.Println("Checking whether optional")
+				//fmt.Println("Checking whether optional")
 				shouldSkip, err := f.GetBool()
 				if err != nil {
 					return err
 				}
-				fmt.Println("shouldSkip: ", shouldSkip)
+				//fmt.Println("shouldSkip: ", shouldSkip)
 				if shouldSkip {
+					if e.Type().Field(i).Name == "Labels" {
+						fmt.Println(f.data[:f.position])
+						panic("Done")
+					}
 					continue
 				}
 			}
@@ -197,7 +202,7 @@ func (f *ConsumeFuzzer) fuzzStruct(e reflect.Value, customFunctions bool) error 
 			}
 		}
 	case reflect.String:
-		fmt.Println("In GetString")
+		//fmt.Println("In GetString")
 		str, err := f.GetString()
 		if err != nil {
 			return err
@@ -290,6 +295,7 @@ func (f *ConsumeFuzzer) fuzzStruct(e reflect.Value, customFunctions bool) error 
 			e.SetFloat(float64(newFloat))
 		}
 	case reflect.Map:
+		panic("llllllllllllllllll")
 		if e.CanSet() {
 			e.Set(reflect.MakeMap(e.Type()))
 			const maxElements = 50
@@ -446,12 +452,12 @@ func (f *ConsumeFuzzer) GetString() (string, error) {
 	if f.position >= f.dataTotal {
 		return "nil", errors.New("not enough bytes to create string")
 	}
-	fmt.Println("f.position:", f.position)
+	//fmt.Println("f.position:", f.position)
 	length, err := f.GetUint32()
 	if err != nil {
 		return "nil", errors.New("not enough bytes to create string")
 	}
-	fmt.Println("length: ", length)
+	//fmt.Println("length: ", length)
 	if f.position > MaxTotalLen {
 		return "nil", errors.New("created too large a string")
 	}
@@ -466,7 +472,7 @@ func (f *ConsumeFuzzer) GetString() (string, error) {
 		return "nil", errors.New("numbers overflow")
 	}
 	f.position = byteBegin + length
-	fmt.Println(string(f.data[byteBegin:f.position]))
+	//fmt.Println(string(f.data[byteBegin:f.position]))
 	return string(f.data[byteBegin:f.position]), nil
 }
 
@@ -886,14 +892,6 @@ func (f *ConsumeFuzzer) GetFloat32() (float32, error) {
 	if err != nil {
 		return 0, err
 	}
-	littleEndian, err := f.GetBool()
-	if err != nil {
-		return 0, err
-	}
-	if littleEndian {
-		u32LE := binary.LittleEndian.Uint32(u32)
-		return math.Float32frombits(u32LE), nil
-	}
 	u32BE := binary.BigEndian.Uint32(u32)
 	return math.Float32frombits(u32BE), nil
 }
@@ -902,14 +900,6 @@ func (f *ConsumeFuzzer) GetFloat64() (float64, error) {
 	u64, err := f.GetNBytes(8)
 	if err != nil {
 		return 0, err
-	}
-	littleEndian, err := f.GetBool()
-	if err != nil {
-		return 0, err
-	}
-	if littleEndian {
-		u64LE := binary.LittleEndian.Uint64(u64)
-		return math.Float64frombits(u64LE), nil
 	}
 	u64BE := binary.BigEndian.Uint64(u64)
 	return math.Float64frombits(u64BE), nil

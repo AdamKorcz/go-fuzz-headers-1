@@ -2,9 +2,10 @@ package gofuzzheaders
 
 import (
 	"bytes"
-	"fmt"
+	//"fmt"
 	"reflect"
 	"unsafe"
+	"strings"
 )
 
 type SeedGenerator struct {
@@ -19,14 +20,14 @@ func NewSeedGenerator() *SeedGenerator {
 		b: b,
 	}
 }
-func (f *SeedGenerator) GenerateSeed(targetStruct interface{}) error {
-	return f.GenerateStruct(targetStruct)
+func (f *SeedGenerator) GenerateSeed(targetStruct interface{}) ([]byte) {
+	f.GenerateStruct(targetStruct)
+	return f.b.Bytes()
 }
 
 func (f *SeedGenerator) GenerateStruct(targetStruct interface{}) error {
 	e := reflect.ValueOf(targetStruct).Elem()
 	f.fuzzStruct(e, false)
-	fmt.Println(len(f.b.Bytes()))
 	return nil
 }
 
@@ -41,11 +42,19 @@ func (f *SeedGenerator) fuzzStruct(e reflect.Value, customFunctions bool) error 
 	switch e.Kind() {
 	case reflect.Struct:
 		for i := 0; i < e.NumField(); i++ {
+			//fmt.Println("Field:")
+			if i == 30 {
+				//fmt.Println(f.b.Bytes())
+				//panic("Stop here")
+			}
 			var v reflect.Value
+			//fmt.Printf("%s: \n", e.Type().Field(i).Name)
 
-			fmt.Println("Checking whether optional")
-			// do not skip:
-			f.b.Write([]byte{0x01})
+			jsonTag := e.Type().Field(i).Tag.Get("json")
+			if strings.Contains(jsonTag, ",omitempty") {
+				// do not skip:
+				f.b.Write([]byte{0x01})
+			}
 
 			if !e.Field(i).CanSet() {
 					v = reflect.NewAt(e.Field(i).Type(), unsafe.Pointer(e.Field(i).UnsafeAddr())).Elem()
@@ -60,7 +69,6 @@ func (f *SeedGenerator) fuzzStruct(e reflect.Value, customFunctions bool) error 
 			}
 		}
 	case reflect.String:
-		fmt.Println("In GetString")
 		_, err := f.GetString()
 		if err != nil {
 			return err
@@ -129,12 +137,15 @@ func (f *SeedGenerator) fuzzStruct(e reflect.Value, customFunctions bool) error 
 			const maxElements = 50
 
 			// int(2):
-			f.b.Write([]byte{0x32})
+			f.b.Write([]byte{0x02})
 
 			randQty := 2
 
 			numOfElements := randQty % maxElements
 			for i := 0; i < numOfElements; i++ {
+				if i == 2 {
+
+				}
 				key := reflect.New(e.Type().Key()).Elem()
 				if err := f.fuzzStruct(key, customFunctions); err != nil {
 					return err
@@ -168,14 +179,13 @@ func (f *SeedGenerator) GetStringArray() (reflect.Value, error) {
 
 func (f *SeedGenerator) GetInt() (int, error) {
 	//int(5):
-	f.b.Write([]byte{0x35})
-	return 0, nil
+	f.b.Write([]byte{0x35}) // 5
+	return int(byte(0x35)), nil
 }
 func (f *SeedGenerator) GetByte() (byte, error) {
 	// "a":
 	f.b.Write([]byte{0x61})
-	return byte(0x00), nil
-
+	return byte(0x61), nil
 }
 
 // Not used for Structs
@@ -186,17 +196,17 @@ func (f *SeedGenerator) GetNBytes(numberOfBytes int) ([]byte, error) {
 func (f *SeedGenerator) GetUint16() (uint16, error) {
 	// should be uint16(2)
 	f.b.Write([]byte{0x00, 0x02})
-	return uint16(1337), nil
+	return uint16(2), nil
 }
 func (f *SeedGenerator) GetUint32() (uint32, error) {
 	// should be uint32(2)
 	f.b.Write([]byte{0x00, 0x00, 0x00, 0x02})
-	return uint32(1337), nil
+	return uint32(2), nil
 }
 func (f *SeedGenerator) GetUint64() (uint64, error) {
 	// should be uint32(2)
 	f.b.Write([]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02})
-	return uint64(1337), nil
+	return uint64(2), nil
 }
 func (f *SeedGenerator) GetBytes() ([]byte, error) {
 	f.b.Write([]byte{0x00, 0x00, 0x00, 0x03}) // length
@@ -206,9 +216,10 @@ func (f *SeedGenerator) GetBytes() ([]byte, error) {
 
 
 func (f *SeedGenerator) GetString() (string, error) {
+	//fmt.Println("Writing string")
 	f.b.Write([]byte{0x00, 0x00, 0x00, 0x03}) // length
 	f.b.Write([]byte{0x41,0x42,0x43})
-	return "", nil
+	return "ABC", nil
 }
 
 

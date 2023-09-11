@@ -28,6 +28,25 @@ type TestStruct1 struct {
 	Field3 []byte
 }
 
+type TestStruct2 struct {
+	M map[string]string
+}
+
+func TestMapInStruct(t *testing.T) {
+	data := []byte{0x02,
+				0x00, 0x00, 0x00, 0x03,
+                0x41, 0x42, 0x43,
+				0x00, 0x00, 0x00, 0x03,
+                0x41, 0x42, 0x43}
+    f := NewConsumer(data)
+    ts := &TestStruct2{}
+    f.GenerateStruct(ts)
+    if _, ok := ts.M["ABC"]; !ok {
+    	t.Fatalf("%+v\n", ts)
+    }
+
+}
+
 func TestStruct_fuzzing1(t *testing.T) {
 	data := []byte{
 		0x00, 0x00, 0x00, 0x03, // Length of field 1
