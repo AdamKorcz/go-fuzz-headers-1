@@ -1,4 +1,4 @@
-module github.com/AdaLogics/go-fuzz-headers-1
+module github.com/AdaLogics/go-fuzz-headers
 
 go 1.20
 
