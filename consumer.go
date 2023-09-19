@@ -106,6 +106,7 @@ func (f *ConsumeFuzzer) DisallowUnexportedFields() {
 }
 
 func (f *ConsumeFuzzer) GenerateStruct(targetStruct interface{}) error {
+	fmt.Println("STARTING GENERATESTRUCT")
 	e := reflect.ValueOf(targetStruct).Elem()
 	return f.fuzzStruct(e, false)
 }
@@ -166,11 +167,8 @@ func (f *ConsumeFuzzer) fuzzStruct(e reflect.Value, customFunctions bool) error 
 	switch e.Kind() {
 	case reflect.Struct:
 		for i := 0; i < e.NumField(); i++ {
+			fmt.Println("In struct")
 			var v reflect.Value
-			if e.Type().Field(i).Name == "Labels" {
-				fmt.Println("LABELS: ", f.data[f.position:f.position+10])
-				//panic("Done")
-			}
 			fmt.Println(e.Type().Field(i).Name, "position: ", f.position, "data: ", f.data[f.position:f.position+20])
 			//fmt.Printf("%s: \n", e.Type().Field(i).Name)
 
@@ -185,10 +183,6 @@ func (f *ConsumeFuzzer) fuzzStruct(e reflect.Value, customFunctions bool) error 
 				}
 				//fmt.Println("shouldSkip: ", shouldSkip)
 				if shouldSkip {
-					if e.Type().Field(i).Name == "Labels:" {
-						fmt.Println("LABELS: ", f.data[:f.position])
-						//panic("Done")
-					}
 					continue
 				}
 			}
@@ -338,6 +332,14 @@ func (f *ConsumeFuzzer) fuzzStruct(e reflect.Value, customFunctions bool) error 
 		}
 		if e.CanSet() {
 			e.SetUint(uint64(b))
+		}
+	case reflect.Bool:
+		b, err := f.GetBool()
+		if err != nil {
+			return err
+		}
+		if e.CanSet() {
+			e.SetBool(b)
 		}
 	}
 	return nil
