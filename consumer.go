@@ -106,7 +106,6 @@ func (f *ConsumeFuzzer) DisallowUnexportedFields() {
 }
 
 func (f *ConsumeFuzzer) GenerateStruct(targetStruct interface{}) error {
-	fmt.Println("STARTING GENERATESTRUCT")
 	e := reflect.ValueOf(targetStruct).Elem()
 	return f.fuzzStruct(e, false)
 }
@@ -163,13 +162,12 @@ func (f *ConsumeFuzzer) fuzzStruct(e reflect.Value, customFunctions bool) error 
 			return err
 		}
 	}
-	fmt.Println("HEere1", e.Kind())
+	//fmt.Println("HEere1", e.Kind())
 	switch e.Kind() {
 	case reflect.Struct:
 		for i := 0; i < e.NumField(); i++ {
-			fmt.Println("In struct")
 			var v reflect.Value
-			fmt.Println(e.Type().Field(i).Name, "position: ", f.position, "data: ", f.data[f.position:f.position+20])
+			//fmt.Println(e.Type().Field(i).Name, "position: ", f.position, "data: ", f.data[f.position:f.position+20])
 			//fmt.Printf("%s: \n", e.Type().Field(i).Name)
 
 			// Check if field is optional
@@ -270,12 +268,12 @@ func (f *ConsumeFuzzer) fuzzStruct(e reflect.Value, customFunctions bool) error 
 			e.SetUint(uint64(newInt))
 		}
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		fmt.Println("INT position: ", f.position, f.data[f.position:f.position+10], int(f.data[f.position]))
+		//fmt.Println("INT position: ", f.position, f.data[f.position:f.position+10], int(f.data[f.position]))
 		newInt, err := f.GetInt()
 		if err != nil {
 			return err
 		}
-		fmt.Println("Second pos: f.position ", f.position)
+		//fmt.Println("Second pos: f.position ", f.position)
 		if e.CanSet() {
 			e.SetInt(int64(newInt))
 		}
@@ -296,7 +294,7 @@ func (f *ConsumeFuzzer) fuzzStruct(e reflect.Value, customFunctions bool) error 
 			e.SetFloat(float64(newFloat))
 		}
 	case reflect.Map:
-		fmt.Println("MAP position: ", f.position, f.data[f.position:f.position+10], int(f.data[f.position]))
+		//fmt.Println("MAP position: ", f.position, f.data[f.position:f.position+10], int(f.data[f.position]))
 		if e.CanSet() {
 			e.Set(reflect.MakeMap(e.Type()))
 			const maxElements = 50
@@ -376,7 +374,7 @@ func (f *ConsumeFuzzer) GetInt() (int, error) {
 		return 0, errors.New("not enough bytes to create int")
 	}
 	returnInt := int(f.data[f.position])
-	fmt.Println("returnInt: ", returnInt)
+	//fmt.Println("returnInt: ", returnInt)
 	f.position++
 	return returnInt, nil
 }
