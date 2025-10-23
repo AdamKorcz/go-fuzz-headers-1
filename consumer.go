@@ -1,960 +1,703 @@
-// Copyright 2023 The go-fuzz-headers Authors.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-
 package gofuzzheaders
 
 import (
-	"archive/tar"
-	"bytes"
 	"encoding/binary"
 	"errors"
-	"fmt"
-	"io"
+	"hash/fnv"
 	"math"
-	"os"
-	"path/filepath"
 	"reflect"
-	"strconv"
 	"strings"
-	"time"
-	"unsafe"
+	"sync"
 )
 
-var (
-	MaxTotalLen uint32 = 2000000
-	maxDepth           = 100
-)
+////////////////////////////////////////////////////////////////////////////////
+// Reader — single-cursor, safe, deterministic
+////////////////////////////////////////////////////////////////////////////////
 
-func SetMaxTotalLen(newLen uint32) {
-	MaxTotalLen = newLen
+type Reader struct {
+	b   []byte
+	off int
 }
+
+func NewReader(b []byte) Reader  { return Reader{b: b} }
+func (r *Reader) Remaining() int { return len(r.b) - r.off }
+
+func (r *Reader) ReadByte() (byte, bool) {
+	if r.off >= len(r.b) {
+		return 0, false
+	}
+	v := r.b[r.off]
+	r.off++
+	return v, true
+}
+
+func (r *Reader) ReadBool() (bool, bool) {
+	b, ok := r.ReadByte()
+	if !ok {
+		return false, false
+	}
+	return (b & 1) == 1, true
+}
+
+func (r *Reader) ReadBytesN(n int) ([]byte, bool) {
+	if n < 0 || r.off+n > len(r.b) {
+		return nil, false
+	}
+	s := r.b[r.off : r.off+n]
+	r.off += n
+	return s, true
+}
+
+func (r *Reader) ReadUint64LE() (uint64, bool) {
+	if r.Remaining() < 8 {
+		return 0, false
+	}
+	bs, _ := r.ReadBytesN(8)
+	return binary.LittleEndian.Uint64(bs), true
+}
+
+func (r *Reader) ReadUint32LE() (uint32, bool) {
+	if r.Remaining() < 4 {
+		return 0, false
+	}
+	bs, _ := r.ReadBytesN(4)
+	return binary.LittleEndian.Uint32(bs), true
+}
+
+func (r *Reader) ReadLen(max int) (int, bool) {
+	if max <= 0 {
+		return 0, true
+	}
+	b, ok := r.ReadByte()
+	if !ok {
+		return 0, false
+	}
+	return int(b) % (max + 1), true
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Config
+////////////////////////////////////////////////////////////////////////////////
+
+type Config struct {
+	MaxDepth             int
+	MaxSliceLen          int
+	MaxMapLen            int
+	MaxStringLen         int
+	OptionalPresentNum   int
+	OptionalPresentDenom int
+	ContainersOptional   bool
+}
+
+func DefaultConfig() Config {
+	return Config{
+		MaxDepth:             5,
+		MaxSliceLen:          16,
+		MaxMapLen:            8,
+		MaxStringLen:         64,
+		OptionalPresentNum:   2, // ~2/3 present
+		OptionalPresentDenom: 3,
+		ContainersOptional:   true,
+	}
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// ConsumeFuzzer — keep Funcs for custom generators (funcs.go depends on it)
+////////////////////////////////////////////////////////////////////////////////
 
 type ConsumeFuzzer struct {
-	data                 []byte
-	dataTotal            uint32
-	CommandPart          []byte
-	RestOfArray          []byte
-	NumberOfCalls        int
-	position             uint32
-	fuzzUnexportedFields bool
-	forceUTF8Strings     bool
-	curDepth             int
-	Funcs                map[reflect.Type]reflect.Value
+	r     Reader
+	cfg   Config
+	Funcs map[reflect.Type]reflect.Value
+
+	allowUnexported bool
 }
 
-func IsDivisibleBy(n int, divisibleby int) bool {
-	return (n % divisibleby) == 0
+func NewConsumer(b []byte) *ConsumeFuzzer {
+	return &ConsumeFuzzer{r: NewReader(b), cfg: DefaultConfig(), Funcs: make(map[reflect.Type]reflect.Value)}
 }
 
-func NewConsumer(fuzzData []byte) *ConsumeFuzzer {
-	return &ConsumeFuzzer{
-		data:      fuzzData,
-		dataTotal: uint32(len(fuzzData)),
-		Funcs:     make(map[reflect.Type]reflect.Value),
-		curDepth:  0,
-	}
+func NewConsumerWithConfig(b []byte, cfg Config) *ConsumeFuzzer {
+	return &ConsumeFuzzer{r: NewReader(b), cfg: cfg, Funcs: make(map[reflect.Type]reflect.Value)}
 }
 
-func (f *ConsumeFuzzer) Split(minCalls, maxCalls int) error {
-	if f.dataTotal == 0 {
-		return errors.New("could not split")
-	}
-	numberOfCalls := int(f.data[0])
-	if numberOfCalls < minCalls || numberOfCalls > maxCalls {
-		return errors.New("bad number of calls")
-	}
-	if int(f.dataTotal) < numberOfCalls+numberOfCalls+1 {
-		return errors.New("length of data does not match required parameters")
-	}
+func (cf *ConsumeFuzzer) RemainingBytes() int { return cf.r.Remaining() }
 
-	// Define part 2 and 3 of the data array
-	commandPart := f.data[1 : numberOfCalls+1]
-	restOfArray := f.data[numberOfCalls+1:]
+func (cf *ConsumeFuzzer) AllowUnexportedFields()    { cf.allowUnexported = true }
+func (cf *ConsumeFuzzer) DisallowUnexportedFields() { cf.allowUnexported = false }
 
-	// Just a small check. It is necessary
-	if len(commandPart) != numberOfCalls {
-		return errors.New("length of commandPart does not match number of calls")
-	}
+////////////////////////////////////////////////////////////////////////////////
+// Primitive Get* — preserve original names
+////////////////////////////////////////////////////////////////////////////////
 
-	// Check if restOfArray is divisible by numberOfCalls
-	if !IsDivisibleBy(len(restOfArray), numberOfCalls) {
-		return errors.New("length of commandPart does not match number of calls")
+func (cf *ConsumeFuzzer) GetBool() (bool, error) {
+	b, ok := cf.r.ReadBool()
+	if !ok {
+		return false, errors.New("no bytes left")
 	}
-	f.CommandPart = commandPart
-	f.RestOfArray = restOfArray
-	f.NumberOfCalls = numberOfCalls
+	return b, nil
+}
+
+func (cf *ConsumeFuzzer) GetInt() (int, error) {
+	u, ok := cf.r.ReadUint64LE()
+	if !ok {
+		return 0, errors.New("no bytes left")
+	}
+	return int(int64(u)), nil
+}
+
+func (cf *ConsumeFuzzer) GetUint() (uint, error) {
+	u, ok := cf.r.ReadUint64LE()
+	if !ok {
+		return 0, errors.New("no bytes left")
+	}
+	return uint(u), nil
+}
+
+// GetUint32 returns a uint32 read from the fuzzer's input in little-endian order.
+// If there are not enough bytes left, it returns an error and does not panic.
+// This matches the style of GetUint(), GetInt(), etc.
+func (cf *ConsumeFuzzer) GetUint32() (uint32, error) {
+	u, ok := cf.r.ReadUint32LE()
+	if !ok {
+		return 0, errors.New("no bytes left")
+	}
+	return u, nil
+}
+
+func (cf *ConsumeFuzzer) GetFloat32() (float32, error) {
+	u, ok := cf.r.ReadUint32LE()
+	if !ok {
+		return 0, errors.New("no bytes left")
+	}
+	f := float64(int32(u%200000)) / 1000.0
+	return float32(sanitizeFloat64(f)), nil
+}
+
+func (cf *ConsumeFuzzer) GetFloat64() (float64, error) {
+	u, ok := cf.r.ReadUint64LE()
+	if !ok {
+		return 0, errors.New("no bytes left")
+	}
+	f := float64(int64(u%200000)) / 1000.0
+	return sanitizeFloat64(f), nil
+}
+
+func (cf *ConsumeFuzzer) GetString() (string, error) {
+	n, ok := cf.r.ReadLen(cf.cfg.MaxStringLen)
+	if !ok || n == 0 || cf.r.Remaining() < n {
+		return "", errors.New("no bytes left for string")
+	}
+	bs, ok := cf.r.ReadBytesN(n)
+	if !ok {
+		return "", errors.New("no bytes left for string")
+	}
+	out := make([]byte, n)
+	for i := range bs {
+		b := bs[i]
+		if b < 32 || b > 126 {
+			b = 'a' + (b % 26)
+		}
+		out[i] = b
+	}
+	return string(out), nil
+}
+
+func (cf *ConsumeFuzzer) GetBytes() ([]byte, error) {
+	n, ok := cf.r.ReadLen(cf.cfg.MaxStringLen)
+	if !ok || n == 0 || cf.r.Remaining() < n {
+		return nil, errors.New("no bytes left for bytes")
+	}
+	bs, ok := cf.r.ReadBytesN(n)
+	if !ok {
+		return nil, errors.New("no bytes left for bytes")
+	}
+	out := make([]byte, n)
+	copy(out, bs)
+	return out, nil
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Reflection metadata & helpers
+////////////////////////////////////////////////////////////////////////////////
+
+type fieldMeta struct {
+	index    int
+	kind     reflect.Kind
+	typ      reflect.Type
+	elemType reflect.Type
+	keyType  reflect.Type
+	isPtr    bool
+	optional bool
+	exported bool
+	jsonSkip bool
+}
+
+type typeMeta struct {
+	t      reflect.Type
+	typeID uint64
+	fields []fieldMeta
+}
+
+var typeCache sync.Map
+
+func getTypeMeta(t reflect.Type, cfg Config, allowUnexported bool) *typeMeta {
+	if v, ok := typeCache.Load(t); ok {
+		return v.(*typeMeta)
+	}
+	m := &typeMeta{t: t, typeID: hashType(t)}
+	n := t.NumField()
+	for i := 0; i < n; i++ {
+		f := t.Field(i)
+
+		exported := (f.PkgPath == "")
+		if !exported && !allowUnexported {
+			continue
+		}
+
+		tag := f.Tag.Get("json")
+		jsonSkip := false
+		omitempty := false
+		if tag != "" {
+			parts := strings.Split(tag, ",")
+			for _, p := range parts {
+				if p == "-" {
+					jsonSkip = true
+					break
+				}
+				if p == "omitempty" {
+					omitempty = true
+				}
+			}
+		}
+		if jsonSkip {
+			continue
+		}
+
+		fm := fieldMeta{
+			index:    f.Index[0],
+			kind:     f.Type.Kind(),
+			typ:      f.Type,
+			isPtr:    f.Type.Kind() == reflect.Ptr,
+			optional: omitempty,
+			exported: exported,
+			jsonSkip: jsonSkip,
+		}
+		switch f.Type.Kind() {
+		case reflect.Ptr, reflect.Slice, reflect.Array:
+			fm.elemType = f.Type.Elem()
+		case reflect.Map:
+			fm.elemType = f.Type.Elem()
+			fm.keyType = f.Type.Key()
+		}
+		if cfg.ContainersOptional && (fm.isPtr || fm.kind == reflect.Slice || fm.kind == reflect.Map) {
+			fm.optional = true || fm.optional
+		}
+		m.fields = append(m.fields, fm)
+	}
+	typeCache.Store(t, m)
+	return m
+}
+
+func hashType(t reflect.Type) uint64 {
+	h := fnv.New64a()
+	h.Write([]byte(t.PkgPath()))
+	h.Write([]byte{0})
+	h.Write([]byte(t.Name()))
+	return h.Sum64()
+}
+
+func stablePresent(typeID uint64, fieldIndex int) bool {
+	// Deterministic decision without reading bytes.
+	x := typeID ^ uint64(0x9E3779B185EBCA87*uint64(fieldIndex+1))
+	x ^= x >> 33
+	x *= 0xff51afd7ed558ccd
+	x ^= x >> 33
+	return (x & 1) == 1
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// Public fuzzing entry points required by other files in the repo
+////////////////////////////////////////////////////////////////////////////////
+
+// ensureStructPtr dereferences rv through any number of pointers,
+// allocating along the way, and returns the underlying struct value.
+func ensureStructPtr(rv reflect.Value) (reflect.Value, error) {
+	if rv.Kind() != reflect.Ptr || rv.IsNil() {
+		return reflect.Value{}, errors.New("target must be a non-nil pointer")
+	}
+	// Walk pointer chain, allocating as needed.
+	for rv.Kind() == reflect.Ptr {
+		if rv.IsNil() {
+			rv.Set(reflect.New(rv.Type().Elem()))
+		}
+		rv = rv.Elem()
+	}
+	if rv.Kind() != reflect.Struct {
+		return reflect.Value{}, errors.New("target does not resolve to a struct")
+	}
+	return rv, nil
+}
+
+// ensureMapPtr dereferences rv through any number of pointers,
+// allocating along the way, and returns the underlying map value.
+func ensureMapPtr(rv reflect.Value) (reflect.Value, error) {
+	if rv.Kind() != reflect.Ptr || rv.IsNil() {
+		return reflect.Value{}, errors.New("map target must be a non-nil pointer")
+	}
+	for rv.Kind() == reflect.Ptr {
+		if rv.IsNil() {
+			rv.Set(reflect.New(rv.Type().Elem()))
+		}
+		rv = rv.Elem()
+	}
+	if rv.Kind() != reflect.Map {
+		return reflect.Value{}, errors.New("map target does not resolve to a map")
+	}
+	// Ensure non-nil map
+	if rv.IsNil() {
+		rv.Set(reflect.MakeMapWithSize(rv.Type(), 0))
+	}
+	return rv, nil
+}
+
+func (cf *ConsumeFuzzer) GenerateStruct(target interface{}) error {
+	if target == nil {
+		return errors.New("nil target")
+	}
+	rv, err := ensureStructPtr(reflect.ValueOf(target))
+	if err != nil {
+		return err
+	}
+	// withCustom=true so funcs.go hooks still run
+	return cf.fuzzStruct(rv, true)
+}
+
+// FuzzMap allows repo helpers (e.g., inject_fuzzer.go) to populate a map directly.
+func (cf *ConsumeFuzzer) FuzzMap(target interface{}) error {
+	if target == nil {
+		return errors.New("nil target map")
+	}
+	mv, err := ensureMapPtr(reflect.ValueOf(target))
+	if err != nil {
+		return err
+	}
+	// Build minimal field meta and populate.
+	f := fieldMeta{
+		kind:     reflect.Map,
+		typ:      mv.Type(),
+		elemType: mv.Type().Elem(),
+		keyType:  mv.Type().Key(),
+	}
+	cf.populateMap(mv, f, 0, true)
 	return nil
 }
 
-func (f *ConsumeFuzzer) AllowUnexportedFields() {
-	f.fuzzUnexportedFields = true
+// fuzzStruct is the internal worker expected by funcs.go (withCustom toggles custom funcs)
+func (cf *ConsumeFuzzer) fuzzStruct(rv reflect.Value, withCustom bool) error {
+	cf.populateStruct(rv, 0, withCustom)
+	return nil
 }
 
-func (f *ConsumeFuzzer) DisallowUnexportedFields() {
-	f.fuzzUnexportedFields = false
+////////////////////////////////////////////////////////////////////////////////
+// Population implementing the 3 rules
+////////////////////////////////////////////////////////////////////////////////
+
+func (cf *ConsumeFuzzer) populateStruct(rv reflect.Value, depth int, withCustom bool) {
+	if depth >= cf.cfg.MaxDepth {
+		return
+	}
+	tm := getTypeMeta(rv.Type(), cf.cfg, cf.allowUnexported)
+
+	for _, f := range tm.fields {
+		fv := rv.Field(f.index)
+
+		// Rule 1: presence decision
+		present := true
+		if f.optional {
+			if cf.r.Remaining() > 0 {
+				// one byte presence with bias
+				b, _ := cf.r.ReadByte()
+				den := cf.cfg.OptionalPresentDenom
+				num := cf.cfg.OptionalPresentNum
+				if den <= 0 {
+					present = true
+				} else {
+					present = (int(b) % den) < num
+				}
+			} else {
+				// exhausted → stable, zero-read presence
+				present = stablePresent(tm.typeID, f.index)
+			}
+		}
+		if !present {
+			continue
+		}
+
+		// Creation: non-nil containers when present
+		switch f.kind {
+		case reflect.Ptr:
+			if fv.IsNil() {
+				fv.Set(reflect.New(f.elemType))
+			}
+		case reflect.Map:
+			if fv.IsNil() {
+				fv.Set(reflect.MakeMapWithSize(f.typ, 0))
+			}
+		case reflect.Slice:
+			if fv.IsNil() {
+				fv.Set(reflect.MakeSlice(f.typ, 0, 0))
+			}
+		}
+
+		// Rule 2/3: populate only if bytes remain
+		if cf.r.Remaining() == 0 {
+			continue // Rule 3: exhausted -> do not populate
+		}
+		doPopulate := false
+		if b, ok := cf.r.ReadBool(); ok {
+			doPopulate = b
+		}
+		if !doPopulate || cf.r.Remaining() == 0 {
+			continue
+		}
+
+		// Custom funcs hook (funcs.go registers only for certain types)
+		if withCustom && cf.Funcs != nil {
+			if fn, recv := cf.lookupCustom(fv, f); fn.IsValid() {
+				// call: fn(recv, Continue{F: cf}) — Continue is defined in funcs.go
+				args := []reflect.Value{recv, reflect.ValueOf(Continue{F: cf})}
+				outs := fn.Call(args)
+				if len(outs) == 0 || (len(outs) == 1 && outs[0].IsNil()) {
+					continue // handled
+				}
+				// If custom returned error, fall through to generic population.
+			}
+		}
+
+		// Generic population
+		switch f.kind {
+		case reflect.Slice:
+			cf.populateSlice(fv, f, depth+1, withCustom)
+		case reflect.Map:
+			cf.populateMap(fv, f, depth+1, withCustom)
+		case reflect.Ptr:
+			cf.populateValue(fv.Elem(), depth+1, withCustom)
+		default:
+			cf.populateValue(fv, depth+1, withCustom)
+		}
+	}
 }
 
-func (f *ConsumeFuzzer) AllowNonUTF8Strings() {
-	f.forceUTF8Strings = false
+func (cf *ConsumeFuzzer) populateSlice(fv reflect.Value, f fieldMeta, depth int, withCustom bool) {
+	if depth >= cf.cfg.MaxDepth || cf.r.Remaining() == 0 {
+		return
+	}
+	n, ok := cf.r.ReadLen(minInt(cf.cfg.MaxSliceLen, 255))
+	if !ok || n <= 0 {
+		return
+	}
+	// Fast path for []byte
+	if f.elemType.Kind() == reflect.Uint8 {
+		if cf.r.Remaining() < n {
+			return
+		}
+		bs, ok := cf.r.ReadBytesN(n)
+		if !ok {
+			return
+		}
+		out := make([]byte, n)
+		copy(out, bs)
+		fv.SetBytes(out)
+		return
+	}
+	s := reflect.MakeSlice(f.typ, n, n)
+	for i := 0; i < n && cf.r.Remaining() > 0; i++ {
+		cf.populateValue(s.Index(i), depth+1, withCustom)
+	}
+	fv.Set(s)
 }
 
-func (f *ConsumeFuzzer) DisallowNonUTF8Strings() {
-	f.forceUTF8Strings = true
+func (cf *ConsumeFuzzer) populateMap(fv reflect.Value, f fieldMeta, depth int, withCustom bool) {
+	if depth >= cf.cfg.MaxDepth || cf.r.Remaining() == 0 {
+		return
+	}
+	n, ok := cf.r.ReadLen(minInt(cf.cfg.MaxMapLen, 127))
+	if !ok || n <= 0 {
+		return
+	}
+	for i := 0; i < n && cf.r.Remaining() > 0; i++ {
+		kv := reflect.New(f.keyType).Elem()
+		vv := reflect.New(f.elemType).Elem()
+		cf.populateValue(kv, depth+1, withCustom)
+		if cf.r.Remaining() == 0 {
+			break
+		}
+		cf.populateValue(vv, depth+1, withCustom)
+		fv.SetMapIndex(kv, vv)
+	}
 }
 
-func (f *ConsumeFuzzer) GenerateStruct(targetStruct interface{}) error {
-	e := reflect.ValueOf(targetStruct).Elem()
-	return f.fuzzStruct(e, false)
-}
-
-func (f *ConsumeFuzzer) setCustom(v reflect.Value) error {
-	// First: see if we have a fuzz function for it.
-	doCustom, ok := f.Funcs[v.Type()]
-	if !ok {
-		return fmt.Errorf("could not find a custom function")
+func (cf *ConsumeFuzzer) populateValue(v reflect.Value, depth int, withCustom bool) {
+	if depth >= cf.cfg.MaxDepth || !v.CanSet() || cf.r.Remaining() == 0 {
+		return
 	}
 
 	switch v.Kind() {
+	case reflect.Bool:
+		if b, ok := cf.r.ReadBool(); ok {
+			v.SetBool(b)
+		}
+
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		if u, ok := cf.r.ReadUint64LE(); ok {
+			setIntClamp(v, int64(u))
+		}
+
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		if u, ok := cf.r.ReadUint64LE(); ok {
+			setUintClamp(v, u)
+		}
+
+	case reflect.Float32:
+		if u, ok := cf.r.ReadUint32LE(); ok {
+			f := float64(int32(u%200000)) / 1000.0
+			v.SetFloat(float64(float32(f)))
+		}
+
+	case reflect.Float64:
+		if u, ok := cf.r.ReadUint64LE(); ok {
+			f := float64(int64(u%200000)) / 1000.0
+			v.SetFloat(sanitizeFloat64(f))
+		}
+
+	case reflect.String:
+		n, ok := cf.r.ReadLen(cf.cfg.MaxStringLen)
+		if !ok || n == 0 || cf.r.Remaining() < n {
+			return
+		}
+		bs, ok := cf.r.ReadBytesN(n)
+		if !ok {
+			return
+		}
+		out := make([]byte, n)
+		for i := range bs {
+			b := bs[i]
+			if b < 32 || b > 126 {
+				b = 'a' + (b % 26)
+			}
+			out[i] = b
+		}
+		v.SetString(string(out))
+
+	case reflect.Slice:
+		f := fieldMeta{typ: v.Type(), elemType: v.Type().Elem(), kind: v.Kind()}
+		cf.populateSlice(v, f, depth+1, withCustom)
+
+	case reflect.Map:
+		f := fieldMeta{typ: v.Type(), elemType: v.Type().Elem(), keyType: v.Type().Key(), kind: v.Kind()}
+		if v.IsNil() {
+			v.Set(reflect.MakeMapWithSize(v.Type(), 0))
+		}
+		cf.populateMap(v, f, depth+1, withCustom)
+
+	case reflect.Struct:
+		cf.populateStruct(v, depth+1, withCustom)
+
 	case reflect.Ptr:
 		if v.IsNil() {
-			if !v.CanSet() {
-				return fmt.Errorf("could not use a custom function")
-			}
 			v.Set(reflect.New(v.Type().Elem()))
 		}
-	case reflect.Map:
-		if v.IsNil() {
-			if !v.CanSet() {
-				return fmt.Errorf("could not use a custom function")
-			}
-			v.Set(reflect.MakeMap(v.Type()))
-		}
-	default:
-		return fmt.Errorf("could not use a custom function")
-	}
+		cf.populateValue(v.Elem(), depth+1, withCustom)
 
-	verr := doCustom.Call([]reflect.Value{v, reflect.ValueOf(Continue{
-		F: f,
-	})})
-
-	// check if we return an error
-	if verr[0].IsNil() {
-		return nil
+	case reflect.Interface:
+		// Leave nil by default
 	}
-	return fmt.Errorf("could not use a custom function")
 }
 
-func (f *ConsumeFuzzer) fuzzStruct(e reflect.Value, customFunctions bool) error {
-	if f.curDepth >= maxDepth {
-		// return err or nil here?
-		return nil
+////////////////////////////////////////////////////////////////////////////////
+// Custom funcs lookup (only if withCustom==true)
+////////////////////////////////////////////////////////////////////////////////
+
+func (cf *ConsumeFuzzer) lookupCustom(fv reflect.Value, f fieldMeta) (fn reflect.Value, recv reflect.Value) {
+	if cf.Funcs == nil {
+		return reflect.Value{}, reflect.Value{}
 	}
-	f.curDepth++
-	defer func() { f.curDepth-- }()
-
-	// We check if we should check for custom functions
-	if customFunctions && e.IsValid() && e.CanAddr() {
-		err := f.setCustom(e.Addr())
-		if err != nil {
-			return err
+	// Exact type first
+	if fn, ok := cf.Funcs[fv.Type()]; ok {
+		return fn, fv
+	}
+	// Pointer-to-field
+	if fv.CanAddr() {
+		if fn, ok := cf.Funcs[fv.Addr().Type()]; ok {
+			// ensure pointer receiver is non-nil for ptr kinds
+			if fv.Kind() == reflect.Ptr && fv.IsNil() {
+				fv.Set(reflect.New(fv.Type().Elem()))
+			}
+			return fn, fv.Addr()
 		}
 	}
+	// For pointer fields: try function registered on pointer type directly
+	if f.isPtr {
+		if fn, ok := cf.Funcs[f.typ]; ok {
+			return fn, fv
+		}
+	}
+	return reflect.Value{}, reflect.Value{}
+}
 
-	switch e.Kind() {
-	case reflect.Struct:
-		for i := 0; i < e.NumField(); i++ {
-			var v reflect.Value
-			if !e.Field(i).CanSet() {
-				if f.fuzzUnexportedFields {
-					v = reflect.NewAt(e.Field(i).Type(), unsafe.Pointer(e.Field(i).UnsafeAddr())).Elem()
-				}
-				if err := f.fuzzStruct(v, customFunctions); err != nil {
-					return err
-				}
-			} else {
-				v = e.Field(i)
-				if err := f.fuzzStruct(v, customFunctions); err != nil {
-					return err
-				}
-			}
-		}
-	case reflect.String:
-		str, err := f.GetString()
-		if err != nil {
-			return err
-		}
-		if e.CanSet() {
-			e.SetString(str)
-		}
-	case reflect.Slice:
-		var maxElements uint32
-		// Byte slices should not be restricted
-		if e.Type().String() == "[]uint8" {
-			maxElements = 10000000
-		} else {
-			maxElements = 50
-		}
+////////////////////////////////////////////////////////////////////////////////
+// Helpers
+////////////////////////////////////////////////////////////////////////////////
 
-		randQty, err := f.GetUint32()
-		if err != nil {
-			return err
+func setIntClamp(v reflect.Value, x int64) {
+	switch v.Kind() {
+	case reflect.Int8:
+		v.SetInt(int64(int8(x)))
+	case reflect.Int16:
+		v.SetInt(int64(int16(x)))
+	case reflect.Int32:
+		v.SetInt(int64(int32(x)))
+	case reflect.Int, reflect.Int64:
+		bits := v.Type().Bits()
+		max := int64(1)<<(bits-1) - 1
+		min := -max - 1
+		if x > max {
+			x = max
+		} else if x < min {
+			x = min
 		}
-		numOfElements := randQty % maxElements
-		if (f.dataTotal - f.position) < numOfElements {
-			numOfElements = f.dataTotal - f.position
-		}
+		v.SetInt(x)
+	}
+}
 
-		uu := reflect.MakeSlice(e.Type(), int(numOfElements), int(numOfElements))
-
-		for i := 0; i < int(numOfElements); i++ {
-			// If we have more than 10, then we can proceed with that.
-			if err := f.fuzzStruct(uu.Index(i), customFunctions); err != nil {
-				if i >= 10 {
-					if e.CanSet() {
-						e.Set(uu)
-					}
-					return nil
-				} else {
-					return err
-				}
-			}
-		}
-		if e.CanSet() {
-			e.Set(uu)
-		}
-	case reflect.Uint:
-		newInt, err := f.GetUint()
-		if err != nil {
-			return err
-		}
-		if e.CanSet() {
-			e.SetUint(uint64(newInt))
-		}
-	case reflect.Uint16:
-		newInt, err := f.GetUint16()
-		if err != nil {
-			return err
-		}
-		if e.CanSet() {
-			e.SetUint(uint64(newInt))
-		}
-	case reflect.Uint32:
-		newInt, err := f.GetUint32()
-		if err != nil {
-			return err
-		}
-		if e.CanSet() {
-			e.SetUint(uint64(newInt))
-		}
-	case reflect.Uint64:
-		newInt, err := f.GetInt()
-		if err != nil {
-			return err
-		}
-		if e.CanSet() {
-			e.SetUint(uint64(newInt))
-		}
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
-		newInt, err := f.GetInt()
-		if err != nil {
-			return err
-		}
-		if e.CanSet() {
-			e.SetInt(int64(newInt))
-		}
-	case reflect.Float32:
-		newFloat, err := f.GetFloat32()
-		if err != nil {
-			return err
-		}
-		if e.CanSet() {
-			e.SetFloat(float64(newFloat))
-		}
-	case reflect.Float64:
-		newFloat, err := f.GetFloat64()
-		if err != nil {
-			return err
-		}
-		if e.CanSet() {
-			e.SetFloat(float64(newFloat))
-		}
-	case reflect.Map:
-		if e.CanSet() {
-			e.Set(reflect.MakeMap(e.Type()))
-			const maxElements = 50
-			randQty, err := f.GetInt()
-			if err != nil {
-				return err
-			}
-			numOfElements := randQty % maxElements
-			for i := 0; i < numOfElements; i++ {
-				key := reflect.New(e.Type().Key()).Elem()
-				if err := f.fuzzStruct(key, customFunctions); err != nil {
-					return err
-				}
-				val := reflect.New(e.Type().Elem()).Elem()
-				if err = f.fuzzStruct(val, customFunctions); err != nil {
-					return err
-				}
-				e.SetMapIndex(key, val)
-			}
-		}
-	case reflect.Ptr:
-		if e.CanSet() {
-			e.Set(reflect.New(e.Type().Elem()))
-			if err := f.fuzzStruct(e.Elem(), customFunctions); err != nil {
-				return err
-			}
-			return nil
-		}
+func setUintClamp(v reflect.Value, x uint64) {
+	switch v.Kind() {
 	case reflect.Uint8:
-		b, err := f.GetByte()
-		if err != nil {
-			return err
+		v.SetUint(uint64(uint8(x)))
+	case reflect.Uint16:
+		v.SetUint(uint64(uint16(x)))
+	case reflect.Uint32:
+		v.SetUint(uint64(uint32(x)))
+	case reflect.Uint, reflect.Uint64, reflect.Uintptr:
+		bits := v.Type().Bits()
+		if bits < 64 {
+			x &= (uint64(1) << bits) - 1
 		}
-		if e.CanSet() {
-			e.SetUint(uint64(b))
-		}
-	case reflect.Bool:
-		b, err := f.GetBool()
-		if err != nil {
-			return err
-		}
-		if e.CanSet() {
-			e.SetBool(b)
-		}
-	}
-	return nil
-}
-
-func (f *ConsumeFuzzer) GetStringArray() (reflect.Value, error) {
-	// The max size of the array:
-	const max uint32 = 20
-
-	arraySize := f.position
-	if arraySize > max {
-		arraySize = max
-	}
-	stringArray := reflect.MakeSlice(reflect.SliceOf(reflect.TypeOf("string")), int(arraySize), int(arraySize))
-	if f.position+arraySize >= f.dataTotal {
-		return stringArray, errors.New("could not make string array")
-	}
-
-	for i := 0; i < int(arraySize); i++ {
-		stringSize := uint32(f.data[f.position])
-		if f.position+stringSize >= f.dataTotal {
-			return stringArray, nil
-		}
-		stringToAppend := string(f.data[f.position : f.position+stringSize])
-		strVal := reflect.ValueOf(stringToAppend)
-		stringArray = reflect.Append(stringArray, strVal)
-		f.position += stringSize
-	}
-	return stringArray, nil
-}
-
-func (f *ConsumeFuzzer) GetInt() (int, error) {
-	if f.position >= f.dataTotal {
-		return 0, errors.New("not enough bytes to create int")
-	}
-	returnInt := int(f.data[f.position])
-	f.position++
-	return returnInt, nil
-}
-
-func (f *ConsumeFuzzer) GetByte() (byte, error) {
-	if f.position >= f.dataTotal {
-		return 0x00, errors.New("not enough bytes to get byte")
-	}
-	returnByte := f.data[f.position]
-	f.position++
-	return returnByte, nil
-}
-
-func (f *ConsumeFuzzer) GetNBytes(numberOfBytes int) ([]byte, error) {
-	if f.position >= f.dataTotal {
-		return nil, errors.New("not enough bytes to get byte")
-	}
-	returnBytes := make([]byte, 0, numberOfBytes)
-	for i := 0; i < numberOfBytes; i++ {
-		newByte, err := f.GetByte()
-		if err != nil {
-			return nil, err
-		}
-		returnBytes = append(returnBytes, newByte)
-	}
-	return returnBytes, nil
-}
-
-func (f *ConsumeFuzzer) GetUint16() (uint16, error) {
-	u16, err := f.GetNBytes(2)
-	if err != nil {
-		return 0, err
-	}
-	littleEndian, err := f.GetBool()
-	if err != nil {
-		return 0, err
-	}
-	if littleEndian {
-		return binary.LittleEndian.Uint16(u16), nil
-	}
-	return binary.BigEndian.Uint16(u16), nil
-}
-
-func (f *ConsumeFuzzer) GetUint32() (uint32, error) {
-	u32, err := f.GetNBytes(4)
-	if err != nil {
-		return 0, err
-	}
-	return binary.BigEndian.Uint32(u32), nil
-}
-
-func (f *ConsumeFuzzer) GetUint64() (uint64, error) {
-	u64, err := f.GetNBytes(8)
-	if err != nil {
-		return 0, err
-	}
-	littleEndian, err := f.GetBool()
-	if err != nil {
-		return 0, err
-	}
-	if littleEndian {
-		return binary.LittleEndian.Uint64(u64), nil
-	}
-	return binary.BigEndian.Uint64(u64), nil
-}
-
-func (f *ConsumeFuzzer) GetUint() (uint, error) {
-	var zero uint
-	size := int(unsafe.Sizeof(zero))
-	if size == 8 {
-		u64, err := f.GetUint64()
-		if err != nil {
-			return 0, err
-		}
-		return uint(u64), nil
-	}
-	u32, err := f.GetUint32()
-	if err != nil {
-		return 0, err
-	}
-	return uint(u32), nil
-}
-
-func (f *ConsumeFuzzer) GetBytes() ([]byte, error) {
-	var length uint32
-	var err error
-	length, err = f.GetUint32()
-	if err != nil {
-		return nil, errors.New("not enough bytes to create byte array")
-	}
-
-	if length == 0 {
-		length = 30
-	}
-	bytesLeft := f.dataTotal - f.position
-	if bytesLeft <= 0 {
-		return nil, errors.New("not enough bytes to create byte array")
-	}
-
-	// If the length is the same as bytes left, we will not overflow
-	// the remaining bytes.
-	if length != bytesLeft {
-		length = length % bytesLeft
-	}
-	byteBegin := f.position
-	if byteBegin+length < byteBegin {
-		return nil, errors.New("numbers overflow")
-	}
-	f.position = byteBegin + length
-	return f.data[byteBegin:f.position], nil
-}
-
-func (f *ConsumeFuzzer) GetString() (string, error) {
-	if f.position >= f.dataTotal {
-		return "nil", errors.New("not enough bytes to create string")
-	}
-	length, err := f.GetUint32()
-	if err != nil {
-		return "nil", errors.New("not enough bytes to create string")
-	}
-	if f.position > MaxTotalLen {
-		return "nil", errors.New("created too large a string")
-	}
-	byteBegin := f.position
-	if byteBegin >= f.dataTotal {
-		return "nil", errors.New("not enough bytes to create string")
-	}
-	if byteBegin+length > f.dataTotal {
-		return "nil", errors.New("not enough bytes to create string")
-	}
-	if byteBegin > byteBegin+length {
-		return "nil", errors.New("numbers overflow")
-	}
-	f.position = byteBegin + length
-	s := string(f.data[byteBegin:f.position])
-	if f.forceUTF8Strings {
-		s = strings.ToValidUTF8(s, "")
-	}
-	return s, nil
-}
-
-func (f *ConsumeFuzzer) GetBool() (bool, error) {
-	if f.position >= f.dataTotal {
-		return false, errors.New("not enough bytes to create bool")
-	}
-	if IsDivisibleBy(int(f.data[f.position]), 2) {
-		f.position++
-		return true, nil
-	} else {
-		f.position++
-		return false, nil
+		v.SetUint(x)
 	}
 }
 
-func (f *ConsumeFuzzer) FuzzMap(m interface{}) error {
-	return f.GenerateStruct(m)
+func sanitizeFloat64(x float64) float64 {
+	if math.IsNaN(x) || math.IsInf(x, 0) {
+		return 0
+	}
+	return x
 }
 
-func returnTarBytes(buf []byte) ([]byte, error) {
-	return buf, nil
-	// Count files
-	var fileCounter int
-	tr := tar.NewReader(bytes.NewReader(buf))
-	for {
-		_, err := tr.Next()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return nil, err
-		}
-		fileCounter++
+func minInt(a, b int) int {
+	if a < b {
+		return a
 	}
-	if fileCounter >= 1 {
-		return buf, nil
-	}
-	return nil, fmt.Errorf("not enough files were created\n")
-}
-
-func setTarHeaderFormat(hdr *tar.Header, f *ConsumeFuzzer) error {
-	ind, err := f.GetInt()
-	if err != nil {
-		hdr.Format = tar.FormatGNU
-		//return nil
-	}
-	switch ind % 4 {
-	case 0:
-		hdr.Format = tar.FormatUnknown
-	case 1:
-		hdr.Format = tar.FormatUSTAR
-	case 2:
-		hdr.Format = tar.FormatPAX
-	case 3:
-		hdr.Format = tar.FormatGNU
-	}
-	return nil
-}
-
-func setTarHeaderTypeflag(hdr *tar.Header, f *ConsumeFuzzer) error {
-	ind, err := f.GetInt()
-	if err != nil {
-		return err
-	}
-	switch ind % 13 {
-	case 0:
-		hdr.Typeflag = tar.TypeReg
-	case 1:
-		hdr.Typeflag = tar.TypeLink
-		linkname, err := f.GetString()
-		if err != nil {
-			return err
-		}
-		hdr.Linkname = linkname
-	case 2:
-		hdr.Typeflag = tar.TypeSymlink
-		linkname, err := f.GetString()
-		if err != nil {
-			return err
-		}
-		hdr.Linkname = linkname
-	case 3:
-		hdr.Typeflag = tar.TypeChar
-	case 4:
-		hdr.Typeflag = tar.TypeBlock
-	case 5:
-		hdr.Typeflag = tar.TypeDir
-	case 6:
-		hdr.Typeflag = tar.TypeFifo
-	case 7:
-		hdr.Typeflag = tar.TypeCont
-	case 8:
-		hdr.Typeflag = tar.TypeXHeader
-	case 9:
-		hdr.Typeflag = tar.TypeXGlobalHeader
-	case 10:
-		hdr.Typeflag = tar.TypeGNUSparse
-	case 11:
-		hdr.Typeflag = tar.TypeGNULongName
-	case 12:
-		hdr.Typeflag = tar.TypeGNULongLink
-	}
-	return nil
-}
-
-func (f *ConsumeFuzzer) createTarFileBody() ([]byte, error) {
-	return f.GetBytes()
-	/*length, err := f.GetUint32()
-	if err != nil {
-		return nil, errors.New("not enough bytes to create byte array")
-	}
-
-	// A bit of optimization to attempt to create a file body
-	// when we don't have as many bytes left as "length"
-	remainingBytes := f.dataTotal - f.position
-	if remainingBytes <= 0 {
-		return nil, errors.New("created too large a string")
-	}
-	if f.position+length > MaxTotalLen {
-		return nil, errors.New("created too large a string")
-	}
-	byteBegin := f.position
-	if byteBegin >= f.dataTotal {
-		return nil, errors.New("not enough bytes to create byte array")
-	}
-	if length == 0 {
-		return nil, errors.New("zero-length is not supported")
-	}
-	if byteBegin+length >= f.dataTotal {
-		return nil, errors.New("not enough bytes to create byte array")
-	}
-	if byteBegin+length < byteBegin {
-		return nil, errors.New("numbers overflow")
-	}
-	f.position = byteBegin + length
-	return f.data[byteBegin:f.position], nil*/
-}
-
-// getTarFileName is similar to GetString(), but creates string based
-// on the length of f.data to reduce the likelihood of overflowing
-// f.data.
-func (f *ConsumeFuzzer) getTarFilename() (string, error) {
-	return f.GetString()
-	/*length, err := f.GetUint32()
-	if err != nil {
-		return "nil", errors.New("not enough bytes to create string")
-	}
-
-	// A bit of optimization to attempt to create a file name
-	// when we don't have as many bytes left as "length"
-	remainingBytes := f.dataTotal - f.position
-	if remainingBytes <= 0 {
-		return "nil", errors.New("created too large a string")
-	}
-	if f.position > MaxTotalLen {
-		return "nil", errors.New("created too large a string")
-	}
-	byteBegin := f.position
-	if byteBegin >= f.dataTotal {
-		return "nil", errors.New("not enough bytes to create string")
-	}
-	if byteBegin+length > f.dataTotal {
-		return "nil", errors.New("not enough bytes to create string")
-	}
-	if byteBegin > byteBegin+length {
-		return "nil", errors.New("numbers overflow")
-	}
-	f.position = byteBegin + length
-	return string(f.data[byteBegin:f.position]), nil*/
-}
-
-type TarFile struct {
-	Hdr  *tar.Header
-	Body []byte
-}
-
-// TarBytes returns valid bytes for a tar archive
-func (f *ConsumeFuzzer) TarBytes() ([]byte, error) {
-	numberOfFiles, err := f.GetInt()
-	if err != nil {
-		return nil, err
-	}
-	var tarFiles []*TarFile
-	tarFiles = make([]*TarFile, 0)
-
-	const maxNoOfFiles = 100
-	for i := 0; i < numberOfFiles%maxNoOfFiles; i++ {
-		var filename string
-		var filebody []byte
-		var sec, nsec int
-		var err error
-
-		filename, err = f.getTarFilename()
-		if err != nil {
-			var sb strings.Builder
-			sb.WriteString("file-")
-			sb.WriteString(strconv.Itoa(i))
-			filename = sb.String()
-		}
-		filebody, err = f.createTarFileBody()
-		if err != nil {
-			var sb strings.Builder
-			sb.WriteString("filebody-")
-			sb.WriteString(strconv.Itoa(i))
-			filebody = []byte(sb.String())
-		}
-
-		sec, err = f.GetInt()
-		if err != nil {
-			sec = 1672531200 // beginning of 2023
-		}
-		nsec, err = f.GetInt()
-		if err != nil {
-			nsec = 1703980800 // end of 2023
-		}
-
-		hdr := &tar.Header{
-			Name:    filename,
-			Size:    int64(len(filebody)),
-			Mode:    0o600,
-			ModTime: time.Unix(int64(sec), int64(nsec)),
-		}
-		if err := setTarHeaderTypeflag(hdr, f); err != nil {
-			return []byte(""), err
-		}
-		if err := setTarHeaderFormat(hdr, f); err != nil {
-			return []byte(""), err
-		}
-		tf := &TarFile{
-			Hdr:  hdr,
-			Body: filebody,
-		}
-		tarFiles = append(tarFiles, tf)
-	}
-
-	var buf bytes.Buffer
-	tw := tar.NewWriter(&buf)
-	defer tw.Close()
-
-	for _, tf := range tarFiles {
-		tw.WriteHeader(tf.Hdr)
-		tw.Write(tf.Body)
-	}
-	return buf.Bytes(), nil
-}
-
-// This is similar to TarBytes, but it returns a series of
-// files instead of raw tar bytes. The advantage of this
-// api is that it is cheaper in terms of cpu power to
-// modify or check the files in the fuzzer with TarFiles()
-// because it avoids creating a tar reader.
-func (f *ConsumeFuzzer) TarFiles() ([]*TarFile, error) {
-	numberOfFiles, err := f.GetInt()
-	if err != nil {
-		return nil, err
-	}
-	var tarFiles []*TarFile
-	tarFiles = make([]*TarFile, 0)
-
-	const maxNoOfFiles = 100
-	for i := 0; i < numberOfFiles%maxNoOfFiles; i++ {
-		filename, err := f.getTarFilename()
-		if err != nil {
-			return tarFiles, err
-		}
-		filebody, err := f.createTarFileBody()
-		if err != nil {
-			return tarFiles, err
-		}
-
-		sec, err := f.GetInt()
-		if err != nil {
-			return tarFiles, err
-		}
-		nsec, err := f.GetInt()
-		if err != nil {
-			return tarFiles, err
-		}
-
-		hdr := &tar.Header{
-			Name:    filename,
-			Size:    int64(len(filebody)),
-			Mode:    0o600,
-			ModTime: time.Unix(int64(sec), int64(nsec)),
-		}
-		if err := setTarHeaderTypeflag(hdr, f); err != nil {
-			hdr.Typeflag = tar.TypeReg
-		}
-		if err := setTarHeaderFormat(hdr, f); err != nil {
-			return tarFiles, err // should not happend
-		}
-		tf := &TarFile{
-			Hdr:  hdr,
-			Body: filebody,
-		}
-		tarFiles = append(tarFiles, tf)
-	}
-	return tarFiles, nil
-}
-
-// CreateFiles creates pseudo-random files in rootDir.
-// It creates subdirs and places the files there.
-// It is the callers responsibility to ensure that
-// rootDir exists.
-func (f *ConsumeFuzzer) CreateFiles(rootDir string) error {
-	numberOfFiles, err := f.GetInt()
-	if err != nil {
-		return err
-	}
-	maxNumberOfFiles := numberOfFiles % 4000 // This is completely arbitrary
-	if maxNumberOfFiles == 0 {
-		return errors.New("maxNumberOfFiles is nil")
-	}
-
-	var noOfCreatedFiles int
-	for i := 0; i < maxNumberOfFiles; i++ {
-		// The file to create:
-		fileName, err := f.GetString()
-		if err != nil {
-			if noOfCreatedFiles > 0 {
-				// If files have been created, we don't return an error.
-				break
-			} else {
-				return errors.New("could not get fileName")
-			}
-		}
-		if strings.Contains(fileName, "..") || (len(fileName) > 0 && fileName[0] == 47) || strings.Contains(fileName, "\\") {
-			continue
-		}
-		fullFilePath := filepath.Join(rootDir, fileName)
-
-		// Find the subdirectory of the file
-		if subDir := filepath.Dir(fileName); subDir != "" && subDir != "." {
-			// create the dir first; avoid going outside the root dir
-			if strings.Contains(subDir, "../") || (len(subDir) > 0 && subDir[0] == 47) || strings.Contains(subDir, "\\") {
-				continue
-			}
-			dirPath := filepath.Join(rootDir, subDir)
-			if _, err := os.Stat(dirPath); os.IsNotExist(err) {
-				err2 := os.MkdirAll(dirPath, 0o777)
-				if err2 != nil {
-					continue
-				}
-			}
-			fullFilePath = filepath.Join(dirPath, fileName)
-		} else {
-			// Create symlink
-			createSymlink, err := f.GetBool()
-			if err != nil {
-				if noOfCreatedFiles > 0 {
-					break
-				} else {
-					return errors.New("could not create the symlink")
-				}
-			}
-			if createSymlink {
-				symlinkTarget, err := f.GetString()
-				if err != nil {
-					return err
-				}
-				err = os.Symlink(symlinkTarget, fullFilePath)
-				if err != nil {
-					return err
-				}
-				// stop loop here, since a symlink needs no further action
-				noOfCreatedFiles++
-				continue
-			}
-			// We create a normal file
-			fileContents, err := f.GetBytes()
-			if err != nil {
-				if noOfCreatedFiles > 0 {
-					break
-				} else {
-					return errors.New("could not create the file")
-				}
-			}
-			err = os.WriteFile(fullFilePath, fileContents, 0o666)
-			if err != nil {
-				continue
-			}
-			noOfCreatedFiles++
-		}
-	}
-	return nil
-}
-
-// GetStringFrom returns a string that can only consist of characters
-// included in possibleChars. It returns an error if the created string
-// does not have the specified length.
-func (f *ConsumeFuzzer) GetStringFrom(possibleChars string, length int) (string, error) {
-	if (f.dataTotal - f.position) < uint32(length) {
-		return "", errors.New("not enough bytes to create a string")
-	}
-	output := make([]byte, 0, length)
-	for i := 0; i < length; i++ {
-		charIndex, err := f.GetInt()
-		if err != nil {
-			return string(output), err
-		}
-		output = append(output, possibleChars[charIndex%len(possibleChars)])
-	}
-	return string(output), nil
-}
-
-func (f *ConsumeFuzzer) GetRune() ([]rune, error) {
-	stringToConvert, err := f.GetString()
-	if err != nil {
-		return []rune("nil"), err
-	}
-	return []rune(stringToConvert), nil
-}
-
-func (f *ConsumeFuzzer) GetFloat32() (float32, error) {
-	u32, err := f.GetNBytes(4)
-	if err != nil {
-		return 0, err
-	}
-	littleEndian, err := f.GetBool()
-	if err != nil {
-		return 0, err
-	}
-	if littleEndian {
-		u32LE := binary.LittleEndian.Uint32(u32)
-		return math.Float32frombits(u32LE), nil
-	}
-	u32BE := binary.BigEndian.Uint32(u32)
-	return math.Float32frombits(u32BE), nil
-}
-
-func (f *ConsumeFuzzer) GetFloat64() (float64, error) {
-	u64, err := f.GetNBytes(8)
-	if err != nil {
-		return 0, err
-	}
-	littleEndian, err := f.GetBool()
-	if err != nil {
-		return 0, err
-	}
-	if littleEndian {
-		u64LE := binary.LittleEndian.Uint64(u64)
-		return math.Float64frombits(u64LE), nil
-	}
-	u64BE := binary.BigEndian.Uint64(u64)
-	return math.Float64frombits(u64BE), nil
-}
-
-func (f *ConsumeFuzzer) CreateSlice(targetSlice interface{}) error {
-	return f.GenerateStruct(targetSlice)
+	return b
 }
