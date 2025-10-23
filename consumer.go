@@ -322,22 +322,38 @@ func stablePresent(typeID uint64, fieldIndex int) bool {
 
 // ensureStructPtr dereferences rv through any number of pointers,
 // allocating along the way, and returns the underlying struct value.
-func ensureStructPtr(rv reflect.Value) (reflect.Value, error) {
-	if rv.Kind() != reflect.Ptr || rv.IsNil() {
-		return reflect.Value{}, errors.New("target must be a non-nil pointer")
+func ensureStructPtr(v reflect.Value) (reflect.Value, error) {
+	if !v.IsValid() {
+		return reflect.Value{}, errInvalidTarget
+	}
+	// Must start with a pointer.
+	if v.Kind() != reflect.Ptr {
+		return reflect.Value{}, errTargetMustBePtr
 	}
 	// Walk pointer chain, allocating as needed.
-	for rv.Kind() == reflect.Ptr {
-		if rv.IsNil() {
-			rv.Set(reflect.New(rv.Type().Elem()))
+	for v.Kind() == reflect.Ptr {
+		if v.IsNil() {
+			v.Set(reflect.New(v.Type().Elem()))
 		}
-		rv = rv.Elem()
+		v = v.Elem()
 	}
-	if rv.Kind() != reflect.Struct {
-		return reflect.Value{}, errors.New("target does not resolve to a struct")
+	if v.Kind() != reflect.Struct {
+		return reflect.Value{}, errTargetNotStruct
 	}
-	return rv, nil
+	return v, nil
 }
+
+// ---- Small, file-local errors so callers outside this file don't depend on them.
+
+var (
+	errInvalidTarget   = &structError{"invalid target"}
+	errTargetMustBePtr = &structError{"target must be a pointer"}
+	errTargetNotStruct = &structError{"target does not resolve to a struct"}
+)
+
+type structError struct{ s string }
+
+func (e *structError) Error() string { return e.s }
 
 // ensureMapPtr dereferences rv through any number of pointers,
 // allocating along the way, and returns the underlying map value.
@@ -361,16 +377,103 @@ func ensureMapPtr(rv reflect.Value) (reflect.Value, error) {
 	return rv, nil
 }
 
-func (cf *ConsumeFuzzer) GenerateStruct(target interface{}) error {
-	if target == nil {
-		return errors.New("nil target")
+// allocateStructSkeleton walks a struct and ensures containers/pointers/maps
+// and nested structs are created. It NEVER populates values.
+// Slices are forced to length 1 with a zero-value element.
+func (cf *ConsumeFuzzer) allocateStructSkeleton(rv reflect.Value, depth int) {
+	if depth >= cf.cfg.MaxDepth {
+		return
 	}
+	t := rv.Type()
+
+	for i := 0; i < rv.NumField(); i++ {
+		sf := t.Field(i)
+
+		// Respect exported/unexported policy.
+		if sf.PkgPath != "" && !cf.allowUnexported {
+			continue
+		}
+
+		fv := rv.Field(i)
+		cf.allocateFieldSkeleton(fv, depth)
+	}
+}
+
+// allocateFieldSkeleton ensures the value is allocated (if it's a container)
+// without populating its contents. Slices become len==1. It recurses into
+// nested structs and pointer-to-structs up to MaxDepth.
+func (cf *ConsumeFuzzer) allocateFieldSkeleton(fv reflect.Value, depth int) {
+	if !fv.CanSet() {
+		return
+	}
+
+	ft := fv.Type()
+	kind := ft.Kind()
+
+	switch kind {
+	case reflect.Ptr:
+		// Ensure pointer is non-nil.
+		if fv.IsNil() {
+			fv.Set(reflect.New(ft.Elem()))
+		}
+		// Recurse if it points to a struct.
+		if fv.Elem().Kind() == reflect.Struct && depth+1 < cf.cfg.MaxDepth {
+			cf.allocateStructSkeleton(fv.Elem(), depth+1)
+		}
+
+	case reflect.Struct:
+		// Recurse into nested struct.
+		if depth+1 < cf.cfg.MaxDepth {
+			cf.allocateStructSkeleton(fv, depth+1)
+		}
+
+	case reflect.Map:
+		// Create an empty (non-nil) map; do not add entries.
+		if fv.IsNil() {
+			fv.Set(reflect.MakeMapWithSize(ft, 0))
+		}
+
+	case reflect.Slice:
+		// Force a 1-element slice (zero-value element).
+		if fv.IsNil() || fv.Len() == 0 {
+			one := reflect.MakeSlice(ft, 1, 1)
+			// Element remains zero-value (no population).
+			fv.Set(one)
+		} else if fv.Len() > 1 {
+			// Shrink to length 1 to satisfy the contract.
+			fv.SetLen(1)
+		}
+
+	case reflect.Array:
+		// Fixed size; leave elements zero-value (no population).
+
+	default:
+		// Scalars (bool/int/*float/string/…): do nothing — leave zero-value.
+	}
+}
+
+func (cf *ConsumeFuzzer) GenerateStruct(target interface{}) error {
+	// Best-effort per new contract: never error.
+	if target == nil {
+		return nil
+	}
+
 	rv, err := ensureStructPtr(reflect.ValueOf(target))
 	if err != nil {
-		return err
+		// Swallow structural errors; caller asked us to always succeed.
+		return nil
 	}
-	// withCustom=true so funcs.go hooks still run
-	return cf.fuzzStruct(rv, true)
+
+	// No seeds? Create containers but don't populate.
+	if cf.r.Remaining() == 0 {
+		cf.allocateStructSkeleton(rv, 0)
+		return nil
+	}
+
+	// Normal path: let the existing population logic handle things.
+	// Even if seeds run out midway, we still return nil by contract.
+	_ = cf.fuzzStruct(rv, true)
+	return nil
 }
 
 // FuzzMap allows repo helpers (e.g., inject_fuzzer.go) to populate a map directly.

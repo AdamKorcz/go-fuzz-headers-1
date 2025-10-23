@@ -4,6 +4,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"reflect"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -725,4 +727,613 @@ func TestSliceOfStrings_LengthAndValues(t *testing.T) {
 	if out.Tail != "abcdefghij" {
 		t.Fatalf("Tail: got %q want %q", out.Tail, "abcdefghij")
 	}
+}
+
+// innerSeedless is a small nested struct used to test recursive allocation
+// behavior when no seed data (bytes) are available. It includes a mix of
+// scalar, slice, and pointer fields.
+type innerSeedless struct {
+	A int
+	B []string
+	C *int
+}
+
+// outerSeedless combines several container and scalar fields, including a
+// nested struct (St) and a pointer to a nested struct (P). This type is
+// designed to cover all allocation cases: pointers, maps, slices, arrays,
+// scalars, and nested structs.
+type outerSeedless struct {
+	P   *innerSeedless // pointer to struct
+	M   map[string]int // map container
+	S   []uint32       // slice container
+	Arr [3]byte        // fixed-size array
+	I   int            // scalar
+	St  innerSeedless  // nested struct
+}
+
+// -----------------------------------------------------------------------------
+// TestGenerateStruct_NoSeeds_AllocatesMandatoryFields_NoPopulate
+// -----------------------------------------------------------------------------
+//
+// This test verifies the *allocation-only* behavior of GenerateStruct when
+// there are *no seed bytes* available (i.e., insufficient seeds).
+//
+// Expected behavior:
+//   - GenerateStruct MUST return nil (no errors ever).
+//   - All "mandatory" containers (pointers, maps, slices, nested structs)
+//     should be created and non-nil.
+//   - Slices should always have length 1 and contain zero-value elements.
+//   - Maps should be allocated but empty.
+//   - Scalars and array elements should remain zero-values (unpopulated).
+//
+// This ensures that even without bytes left, the consumer still builds a full
+// structural "skeleton" of the target type.
+func TestGenerateStruct_NoSeeds_AllocatesMandatoryFields_NoPopulate(t *testing.T) {
+	// Input: completely empty byte slice => "no seeds"
+	data := []byte{}
+
+	// Use default config but ensure containers are *not optional*,
+	// so all containers are treated as mandatory and should appear.
+	cfg := DefaultConfig()
+	cfg.ContainersOptional = false
+
+	c := NewConsumerWithConfig(data, cfg)
+
+	var out outerSeedless
+	if err := c.GenerateStruct(&out); err != nil {
+		t.Fatalf("GenerateStruct returned an error; expected nil: %v", err)
+	}
+
+	// --- Pointer / Map / Nested struct allocation checks ---
+
+	// Pointer to struct should be allocated and non-nil.
+	if out.P == nil {
+		t.Fatalf("expected out.P (pointer to struct) to be non-nil")
+	}
+	// Map should be allocated and non-nil.
+	if out.M == nil {
+		t.Fatalf("expected out.M (map) to be non-nil")
+	}
+	// Nested struct’s slice and pointer fields should also be allocated.
+	if out.St.B == nil {
+		t.Fatalf("expected out.St.B (slice in nested struct) to be non-nil")
+	}
+	if out.St.C == nil {
+		t.Fatalf("expected out.St.C (pointer in nested struct) to be non-nil")
+	}
+
+	// --- Slice allocation checks ---
+
+	// Top-level slice should be created with len=1.
+	if out.S == nil || len(out.S) != 1 {
+		t.Fatalf("expected out.S (slice) to be length 1; got len=%d", len(out.S))
+	}
+	// Its element should be zero-value (unpopulated).
+	if out.S[0] != 0 {
+		t.Fatalf("expected out.S[0] to be zero-value; got %v", out.S[0])
+	}
+
+	// Nested struct’s slice should also be len=1 with empty element.
+	if out.St.B == nil || len(out.St.B) != 1 {
+		t.Fatalf("expected out.St.B (slice) to be length 1; got len=%d", len(out.St.B))
+	}
+	if out.St.B[0] != "" {
+		t.Fatalf("expected out.St.B[0] to be zero-value string; got %q", out.St.B[0])
+	}
+
+	// --- Map population check ---
+
+	// Maps should be allocated but empty (no data populated).
+	if len(out.M) != 0 {
+		t.Fatalf("expected out.M to be empty; got len=%d", len(out.M))
+	}
+
+	// --- Scalar checks ---
+
+	// All scalar fields should remain zero-value.
+	if out.I != 0 {
+		t.Fatalf("expected out.I (int) to remain zero; got %d", out.I)
+	}
+	if out.P.A != 0 || out.St.A != 0 {
+		t.Fatalf("expected nested scalar fields to remain zero; got P.A=%d St.A=%d", out.P.A, out.St.A)
+	}
+	// Arrays should remain entirely zeroed.
+	if out.Arr != ([3]byte{}) {
+		t.Fatalf("expected out.Arr (array) to remain all-zero; got %v", out.Arr)
+	}
+
+	// --- Nested pointer content check ---
+
+	// Pointer-to-int should be allocated but still hold the zero-value.
+	if out.St.C == nil {
+		t.Fatalf("expected out.St.C to be allocated (non-nil)")
+	}
+	if *out.St.C != 0 {
+		t.Fatalf("expected *out.St.C to be zero; got %d", *out.St.C)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// TestGenerateStruct_AlwaysReturnsNil_WithZeroSeeds
+// -----------------------------------------------------------------------------
+//
+// This test verifies that GenerateStruct *never returns an error*, even when
+// invoked with nil or zero-length input. This enforces the new contract that
+// "insufficient seeds" is not a failure case.
+func TestGenerateStruct_AlwaysReturnsNil_WithZeroSeeds(t *testing.T) {
+	c := NewConsumer([]byte{})
+	var out outerSeedless
+	if err := c.GenerateStruct(&out); err != nil {
+		t.Fatalf("expected nil error; got %v", err)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// TestGenerateStruct_SliceLengthOneAndZeroValues
+// -----------------------------------------------------------------------------
+//
+// This test isolates slice handling to confirm that every slice field is
+// created with exactly one element and that all elements are zero-valued.
+//
+// Expected behavior:
+//   - Each slice should be allocated (non-nil).
+//   - Each slice should have len=1.
+//   - The single element should be zero-value for its type.
+func TestGenerateStruct_SliceLengthOneAndZeroValues(t *testing.T) {
+	// Disable container-optional behavior to guarantee presence of slices.
+	cfg := DefaultConfig()
+	cfg.ContainersOptional = false
+
+	// Using nil == no seeds triggers the allocation-only behavior.
+	c := NewConsumerWithConfig(nil, cfg)
+
+	type sliceHolder struct {
+		Ints    []int
+		Strings []string
+		Bytes   []byte
+	}
+
+	var sh sliceHolder
+	if err := c.GenerateStruct(&sh); err != nil {
+		t.Fatalf("GenerateStruct returned error; expected nil: %v", err)
+	}
+
+	// Int slice: should exist, len=1, and contain zero.
+	if sh.Ints == nil || len(sh.Ints) != 1 || sh.Ints[0] != 0 {
+		t.Fatalf("expected Ints slice len=1 with zero element; got len=%d val=%v", len(sh.Ints), sh.Ints)
+	}
+
+	// String slice: should exist, len=1, and contain empty string.
+	if sh.Strings == nil || len(sh.Strings) != 1 || sh.Strings[0] != "" {
+		t.Fatalf("expected Strings slice len=1 with empty string; got len=%d val=%v", len(sh.Strings), sh.Strings)
+	}
+
+	// Byte slice: should exist, len=1, and contain a single zero byte.
+	if sh.Bytes == nil || len(sh.Bytes) != 1 || sh.Bytes[0] != 0x00 {
+		t.Fatalf("expected Bytes slice len=1 with 0x00; got len=%d val=%v", len(sh.Bytes), sh.Bytes)
+	}
+}
+
+/*
+   ----------------------------------------------------------------------------
+   Minimal Istio-style fuzz scaffolding used by these tests
+   ----------------------------------------------------------------------------
+
+   Helper wraps a testing.T and a ConsumeFuzzer (cf). It mimics the shape used
+   by Istio's fuzz utilities, where a "Helper" is handed around and used by
+   generic helpers like fuzz.Struct[T](fg, validators...).
+
+   We purposely configure the consumer with ContainersOptional=false so that
+   container fields (maps/slices/pointers) are treated as mandatory and created
+   even when there are insufficient seeds, which matches the behavior that
+   Istio relies on when fuzzing its structs.
+*/
+
+type Helper struct {
+	t  *testing.T
+	cf *ConsumeFuzzer
+}
+
+func New(t *testing.T, seed []byte) Helper {
+	cfg := DefaultConfig()
+	cfg.ContainersOptional = false
+	return Helper{t: t, cf: NewConsumerWithConfig(seed, cfg)}
+}
+
+func Struct[T any](h Helper, validators ...func(T) bool) T {
+	d := new(T)
+	if err := h.cf.GenerateStruct(d); err != nil {
+		h.t.Skip(err.Error())
+	}
+	for _, v := range validators {
+		if !v(*d) {
+			h.t.Skip("validator rejected generated value")
+		}
+	}
+	return *d
+}
+
+func runFuzzShim(t *testing.T, seed []byte, ff func(fg Helper)) {
+	BaseCases(t)
+	defer Finalize()
+	fg := New(t, seed)
+	ff(fg)
+}
+
+func BaseCases(t *testing.T) {}
+func Finalize()              {}
+
+// --- Types used in the test (unique names to avoid collisions) ---
+
+// Bundle-like type
+type istioBundle struct {
+	TrustDomain string
+	Aliases     []string
+}
+
+// PushContext-like type
+type istioPushContext struct {
+	MeshID   string
+	Features map[string]bool
+	Gateways []string
+}
+
+// Stand-ins referenced by the Proxy copy
+type istioNodeType int
+
+const (
+	istioNodeSidecar istioNodeType = iota
+	istioNodeRouter
+	istioNodeWaypoint
+)
+
+type istioLocality struct {
+	Region, Zone, Subzone string
+}
+type istioNodeMetadata struct {
+	Namespace string
+	Labels    map[string]string
+}
+type istioSidecarScope struct {
+	Name      string
+	Workloads []string
+}
+type istioMergedGateway struct{ Servers []string }
+type istioPrevMergedGateway struct{ Revision int }
+type istioServiceTarget struct {
+	Name string
+	Port int
+}
+type istioVersion struct{ Major, Minor, Patch int }
+type istioIdentity struct{ SPIFFE string }
+type istioXdsResourceGenerator interface{ Generate() error }
+type istioWatchedResource struct {
+	TypeURL string
+	Name    string
+}
+type istioNode struct {
+	ID       string
+	Cluster  string
+	Metadata map[string]any
+}
+type istioPushCtx struct {
+	Version   string
+	ClusterID string
+	Services  map[string][]int
+}
+
+// Proxy copy (includes an Address []byte field as your earlier assertions expect)
+type proxyCopy struct {
+	sync.RWMutex
+
+	Type            istioNodeType
+	IPAddresses     []string
+	ID              string
+	Locality        *istioLocality
+	DNSDomain       string
+	ConfigNamespace string
+	Labels          map[string]string
+	Metadata        *istioNodeMetadata
+
+	SidecarScope     *istioSidecarScope
+	PrevSidecarScope *istioSidecarScope
+
+	MergedGateway     *istioMergedGateway
+	PrevMergedGateway *istioPrevMergedGateway
+
+	ServiceTargets []istioServiceTarget
+
+	IstioVersion     *istioVersion
+	VerifiedIdentity *istioIdentity
+
+	GlobalUnicastIP string
+
+	XdsResourceGenerator istioXdsResourceGenerator
+	WatchedResources     map[string]*istioWatchedResource
+
+	XdsNode         *istioNode
+	LastPushContext *istioPushCtx
+	LastPushTime    time.Time
+
+	// Byte slice we can assert on deterministically (length > 0 with seed)
+	Address []byte
+}
+
+// Optional validator for PushContext-like
+func validateIstioPush(pc *istioPushContext) bool {
+	return pc != nil && pc.Features != nil && pc.Gateways != nil && len(pc.Gateways) > 0
+}
+
+// Optional validator for Proxy copy
+func validateProxyCopy(p *proxyCopy) bool {
+	return p != nil &&
+		p.IPAddresses != nil &&
+		p.Labels != nil &&
+		p.WatchedResources != nil &&
+		p.Locality != nil &&
+		p.Metadata != nil &&
+		p.SidecarScope != nil &&
+		p.PrevSidecarScope != nil &&
+		p.MergedGateway != nil &&
+		p.PrevMergedGateway != nil &&
+		p.IstioVersion != nil &&
+		p.VerifiedIdentity != nil &&
+		p.XdsNode != nil &&
+		p.LastPushContext != nil
+}
+
+type proxyCopySeedable struct {
+	sync.RWMutex
+
+	Type            istioNodeType
+	IPAddresses     []string
+	ID              string
+	Locality        *istioLocality
+	DNSDomain       string
+	ConfigNamespace string
+	Labels          map[string]string
+	Metadata        *istioNodeMetadata
+
+	SidecarScope     *istioSidecarScope
+	PrevSidecarScope *istioSidecarScope
+
+	MergedGateway     *istioMergedGateway
+	PrevMergedGateway *istioPrevMergedGateway
+
+	ServiceTargets []istioServiceTarget
+
+	IstioVersion     *istioVersion
+	VerifiedIdentity *istioIdentity
+
+	GlobalUnicastIP string
+
+	// XdsResourceGenerator intentionally omitted (interface cannot be seeded)
+	WatchedResources map[string]*istioWatchedResource
+
+	XdsNode         *istioNode
+	LastPushContext *istioPushCtx
+	LastPushTime    time.Time
+	Address         []byte
+}
+
+// assertAllStringsEqual walks v and ensures every string field/elem/key/value equals `want`.
+func assertAllStringsEqual(t *testing.T, name string, v any, want string) {
+	t.Helper()
+	var mismatches []string
+	seen := map[uintptr]bool{}
+
+	var visit func(path string, rv reflect.Value)
+	visit = func(path string, rv reflect.Value) {
+		if !rv.IsValid() {
+			return
+		}
+		// Unwrap interface
+		if rv.Kind() == reflect.Interface && !rv.IsNil() {
+			rv = rv.Elem()
+		}
+		switch rv.Kind() {
+		case reflect.String:
+			if rv.String() != want {
+				mismatches = append(mismatches, fmt.Sprintf("%s = %q", path, rv.String()))
+			}
+		case reflect.Ptr:
+			if rv.IsNil() {
+				return
+			}
+			ptr := rv.Pointer()
+			if ptr != 0 && seen[ptr] {
+				return
+			}
+			if ptr != 0 {
+				seen[ptr] = true
+			}
+			visit(path, rv.Elem())
+		case reflect.Struct:
+			// Treat time.Time as atomic
+			if rv.Type().PkgPath() == "time" && rv.Type().Name() == "Time" {
+				return
+			}
+			for i := 0; i < rv.NumField(); i++ {
+				sf := rv.Type().Field(i)
+				// Skip unexported fields
+				if sf.PkgPath != "" {
+					continue
+				}
+				visit(path+"."+sf.Name, rv.Field(i))
+			}
+		case reflect.Slice, reflect.Array:
+			// Skip []byte; not strings.
+			if rv.Type().Elem().Kind() == reflect.Uint8 {
+				return
+			}
+			for i := 0; i < rv.Len(); i++ {
+				visit(fmt.Sprintf("%s[%d]", path, i), rv.Index(i))
+			}
+		case reflect.Map:
+			iter := rv.MapRange()
+			for iter.Next() {
+				k := iter.Key()
+				val := iter.Value()
+				// Check string keys/values directly, then recurse for nested content.
+				if k.Kind() == reflect.String {
+					if k.String() != want {
+						mismatches = append(mismatches, fmt.Sprintf("%s[<key>] = %q", path, k.String()))
+					}
+				} else {
+					visit(path+"[key]", k)
+				}
+				if val.Kind() == reflect.String {
+					if val.String() != want {
+						mismatches = append(mismatches, fmt.Sprintf("%s[<value>] = %q", path, val.String()))
+					}
+				} else {
+					visit(path+"[value]", val)
+				}
+			}
+		default:
+			return
+		}
+	}
+
+	visit(name, reflect.ValueOf(v))
+	if len(mismatches) > 0 {
+		t.Fatalf("%s: strings not equal to %q:\n  %s", name, want, strings.Join(mismatches, "\n  "))
+	}
+}
+
+func TestIstioStyleWrapper_WithDeterministicSeed(t *testing.T) {
+	cfg := DefaultConfig()
+	pol := DefaultSeedPolicy()
+
+	// Build a seed for the exact types we will generate, in this order:
+	//   1) istioBundle (non-pointer)
+	//   2) *istioPushContext (pointer)
+	//   3) *proxyCopySeedable (pointer; same as proxyCopy but WITHOUT interface field)
+	seed, err := BuildSeedForTypes(
+		cfg, pol,
+		reflect.TypeOf(istioBundle{}),
+		reflect.TypeOf((*istioPushContext)(nil)),
+		reflect.TypeOf((*proxyCopySeedable)(nil)),
+	)
+	if err != nil {
+		t.Fatalf("BuildSeedForTypes failed: %v", err)
+	}
+
+	runFuzzShim(t, seed, func(fg Helper) {
+		want := "abcdefghij"
+
+		// 1) bundle := fuzz.Struct[trustdomain.Bundle](fg)
+		bundle := Struct[istioBundle](fg)
+		// Basic sanity (non-empty due to seed)
+		if bundle.TrustDomain == "" {
+			t.Fatalf("bundle.TrustDomain empty; want non-empty from seed")
+		}
+		if bundle.Aliases == nil || len(bundle.Aliases) == 0 {
+			t.Fatalf("bundle.Aliases not allocated or empty; want non-empty from seed")
+		}
+		// All strings exactly "abcdefghij"
+		assertAllStringsEqual(t, "bundle", bundle, want)
+
+		// 2) push := fuzz.Struct[*model.PushContext](fg, validatePush)
+		push := Struct[*istioPushContext](fg, validateIstioPush)
+		if push == nil {
+			t.Fatalf("push is nil; want non-nil")
+		}
+		// All strings exactly "abcdefghij"
+		assertAllStringsEqual(t, "push", push, want)
+
+		// 3) node := fuzz.Struct[*model.Proxy](fg)
+		node := Struct[*proxyCopy](fg, validateProxyCopy)
+		if node == nil {
+			t.Fatalf("node is nil; want non-nil")
+		}
+		// All strings exactly "abcdefghij"
+		assertAllStringsEqual(t, "node", node, want)
+
+		// Optional: keep a few non-string sanity checks for structure
+		if node.IPAddresses == nil || len(node.IPAddresses) == 0 {
+			t.Fatalf("node.IPAddresses not allocated or empty; want non-empty from seed")
+		}
+		if node.Address == nil || len(node.Address) == 0 {
+			t.Fatalf("node.Address not allocated or empty; want non-empty from seed")
+		}
+		if node.Labels == nil || node.WatchedResources == nil {
+			t.Fatalf("node maps not allocated; want allocated from seed")
+		}
+	})
+}
+
+func TestIstioStyleWrapper_ProxyCopy_InsufficientSeeds(t *testing.T) {
+	seed := []byte{} // triggers insufficient-seeds (allocate-only) path
+
+	runFuzzShim(t, seed, func(fg Helper) {
+		node := Struct[*proxyCopy](fg, validateProxyCopy)
+		if node == nil {
+			t.Fatalf("expected *proxyCopy to be non-nil")
+		}
+
+		// Scalars remain zero
+		if node.ID != "" {
+			t.Fatalf("expected ID to be empty, got %q", node.ID)
+		}
+		if node.DNSDomain != "" {
+			t.Fatalf("expected DNSDomain to be empty, got %q", node.DNSDomain)
+		}
+		if node.ConfigNamespace != "" {
+			t.Fatalf("expected ConfigNamespace to be empty, got %q", node.ConfigNamespace)
+		}
+		if node.GlobalUnicastIP != "" {
+			t.Fatalf("expected GlobalUnicastIP to be empty, got %q", node.GlobalUnicastIP)
+		}
+		if !node.LastPushTime.IsZero() {
+			t.Fatalf("expected LastPushTime to be zero, got %v", node.LastPushTime)
+		}
+
+		// Slices: len==1, zero-value element
+		if node.IPAddresses == nil || len(node.IPAddresses) != 1 {
+			t.Fatalf("expected IPAddresses len==1, got %d", len(node.IPAddresses))
+		}
+		if node.IPAddresses[0] != "" {
+			t.Fatalf("expected IPAddresses[0] to be empty, got %q", node.IPAddresses[0])
+		}
+		if node.ServiceTargets == nil || len(node.ServiceTargets) != 1 {
+			t.Fatalf("expected ServiceTargets len==1, got %d", len(node.ServiceTargets))
+		}
+
+		// Maps: allocated but empty
+		if node.Labels == nil {
+			t.Fatalf("expected Labels allocated")
+		}
+		if len(node.Labels) != 0 {
+			t.Fatalf("expected Labels empty, got len=%d", len(node.Labels))
+		}
+		if node.WatchedResources == nil {
+			t.Fatalf("expected WatchedResources allocated")
+		}
+		if len(node.WatchedResources) != 0 {
+			t.Fatalf("expected WatchedResources empty, got len=%d", len(node.WatchedResources))
+		}
+
+		// Pointers: allocated; contents zero
+		if node.Locality == nil || node.Metadata == nil {
+			t.Fatalf("expected Locality and Metadata allocated")
+		}
+		if node.SidecarScope == nil || node.PrevSidecarScope == nil {
+			t.Fatalf("expected SidecarScope/PrevSidecarScope allocated")
+		}
+		if node.MergedGateway == nil || node.PrevMergedGateway == nil {
+			t.Fatalf("expected MergedGateway/PrevMergedGateway allocated")
+		}
+		if node.IstioVersion == nil || node.VerifiedIdentity == nil {
+			t.Fatalf("expected IstioVersion/VerifiedIdentity allocated")
+		}
+		if node.XdsNode == nil || node.LastPushContext == nil {
+			t.Fatalf("expected XdsNode/LastPushContext allocated")
+		}
+
+		// Interface: nil with insufficient seeds
+		if node.XdsResourceGenerator != nil {
+			t.Fatalf("expected XdsResourceGenerator to be nil")
+		}
+	})
 }
