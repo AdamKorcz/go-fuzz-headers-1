@@ -3,6 +3,7 @@ package gofuzzheaders
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/fnv"
 	"math"
 	"reflect"
@@ -590,6 +591,46 @@ func (cf *ConsumeFuzzer) populateStruct(rv reflect.Value, depth int, withCustom 
 			cf.populateValue(fv, depth+1, withCustom)
 		}
 	}
+}
+
+// CreateSlice creates (in place) a slice of the caller-provided type.
+// It must be called with a non-nil pointer to a slice, e.g.:
+//
+//    var xs []MyType
+//    if err := f.CreateSlice(&xs); err != nil { ... }
+//
+// This is a thin wrapper around populateSlice, keeping parity with the
+// upstream API in github.com/AdaLogics/go-fuzz-headers.
+func (f *ConsumeFuzzer) CreateSlice(targetSlice interface{}) error {
+	if targetSlice == nil {
+		return fmt.Errorf("CreateSlice: nil target")
+	}
+
+	rv := reflect.ValueOf(targetSlice)
+	if rv.Kind() != reflect.Ptr || rv.IsNil() {
+		return fmt.Errorf("CreateSlice: target must be a non-nil pointer")
+	}
+
+	sv := rv.Elem()
+	if sv.Kind() != reflect.Slice {
+		return fmt.Errorf("CreateSlice: target must point to a slice, got %s", sv.Kind())
+	}
+
+	// Build a minimal fieldMeta for this slice type.
+	// Only the fields that populateSlice relies on need to be set.
+	fm := fieldMeta{
+		typ:      sv.Type(),
+		elemType: sv.Type().Elem(),
+		kind:     reflect.Slice,
+		// index is not used here (this is not a struct field), but set a
+		// sentinel to be explicit in case debug code prints it.
+		index: -1,
+	}
+
+	// Delegate to the internal population routine.
+	// depth=0; withCustom=true so custom generators are honored if applicable.
+	f.populateSlice(sv, fm, 0, true)
+	return nil
 }
 
 func (cf *ConsumeFuzzer) populateSlice(fv reflect.Value, f fieldMeta, depth int, withCustom bool) {
