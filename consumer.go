@@ -65,6 +65,14 @@ func (r *Reader) ReadUint32LE() (uint32, bool) {
 	return binary.LittleEndian.Uint32(bs), true
 }
 
+func (r *Reader) ReadUint16LE() (uint16, bool) {
+	if r.Remaining() < 2 {
+		return 0, false
+	}
+	bs, _ := r.ReadBytesN(2)
+	return binary.LittleEndian.Uint16(bs), true
+}
+
 func (r *Reader) ReadLen(max int) (int, bool) {
 	if max <= 0 {
 		return 0, true
@@ -83,6 +91,7 @@ func (r *Reader) ReadLen(max int) (int, bool) {
 type Config struct {
 	MaxDepth             int
 	MaxSliceLen          int
+	MaxByteSliceLen      int  // Separate limit for []byte (binary data)
 	MaxMapLen            int
 	MaxStringLen         int
 	OptionalPresentNum   int
@@ -94,12 +103,127 @@ func DefaultConfig() Config {
 	return Config{
 		MaxDepth:             5,
 		MaxSliceLen:          16,
+		MaxByteSliceLen:      1024,  // Larger for binary data
 		MaxMapLen:            8,
 		MaxStringLen:         64,
 		OptionalPresentNum:   2, // ~2/3 present
 		OptionalPresentDenom: 3,
 		ContainersOptional:   true,
 	}
+}
+
+// KubernetesConfig returns a config optimized for Kubernetes objects
+func KubernetesConfig() Config {
+	return Config{
+		MaxDepth:             10,   // K8s has deep nesting
+		MaxSliceLen:          64,   // Many containers/volumes
+		MaxByteSliceLen:      4096, // Certificates, tokens
+		MaxMapLen:            32,   // Labels, annotations
+		MaxStringLen:         256,  // Long names/namespaces/images
+		OptionalPresentNum:   3,    // 75% present
+		OptionalPresentDenom: 4,
+		ContainersOptional:   false,
+	}
+}
+
+// KubernetesMinimalConfig returns minimal valid K8s objects (corpus-friendly)
+func KubernetesMinimalConfig() Config {
+	return Config{
+		MaxDepth:             7,
+		MaxSliceLen:          4,
+		MaxByteSliceLen:      256,
+		MaxMapLen:            4,
+		MaxStringLen:         64,
+		OptionalPresentNum:   1,
+		OptionalPresentDenom: 3,
+		ContainersOptional:   false,
+	}
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// ConfigBuilder for easy customization
+////////////////////////////////////////////////////////////////////////////////
+
+type ConfigBuilder struct {
+	cfg Config
+}
+
+func NewConfigBuilder(base Config) *ConfigBuilder {
+	return &ConfigBuilder{cfg: base}
+}
+
+func (b *ConfigBuilder) WithMaxDepth(n int) *ConfigBuilder {
+	b.cfg.MaxDepth = n
+	return b
+}
+
+func (b *ConfigBuilder) WithMaxSliceLen(n int) *ConfigBuilder {
+	b.cfg.MaxSliceLen = n
+	return b
+}
+
+func (b *ConfigBuilder) WithMaxByteSliceLen(n int) *ConfigBuilder {
+	b.cfg.MaxByteSliceLen = n
+	return b
+}
+
+func (b *ConfigBuilder) WithMaxMapLen(n int) *ConfigBuilder {
+	b.cfg.MaxMapLen = n
+	return b
+}
+
+func (b *ConfigBuilder) WithMaxStringLen(n int) *ConfigBuilder {
+	b.cfg.MaxStringLen = n
+	return b
+}
+
+func (b *ConfigBuilder) WithOptionalPresence(num, denom int) *ConfigBuilder {
+	b.cfg.OptionalPresentNum = num
+	b.cfg.OptionalPresentDenom = denom
+	return b
+}
+
+func (b *ConfigBuilder) WithContainersOptional(optional bool) *ConfigBuilder {
+	b.cfg.ContainersOptional = optional
+	return b
+}
+
+func (b *ConfigBuilder) Build() Config {
+	return b.cfg
+}
+
+////////////////////////////////////////////////////////////////////////////////
+// PresenceBitmap for efficient optional field presence decisions
+////////////////////////////////////////////////////////////////////////////////
+
+type PresenceBitmap struct {
+	bits          uint64
+	bitsRemaining int
+}
+
+func (pb *PresenceBitmap) Reset() {
+	pb.bits = 0
+	pb.bitsRemaining = 0
+}
+
+// Next consumes one bit for presence decision
+func (pb *PresenceBitmap) Next(r *Reader) bool {
+	if pb.bitsRemaining == 0 {
+		// Need more bits
+		pb.bits, _ = r.ReadUint64LE()
+		pb.bitsRemaining = 64
+	}
+	present := (pb.bits & 1) == 1
+	pb.bits >>= 1
+	pb.bitsRemaining--
+	return present
+}
+
+// Object pool for PresenceBitmaps
+var presenceBitmapPool = sync.Pool{
+	New: func() interface{} {
+		return &PresenceBitmap{}
+	},
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -230,6 +354,7 @@ type fieldMeta struct {
 	keyType  reflect.Type
 	isPtr    bool
 	optional bool
+	required bool  // Explicitly required (overrides optional)
 	exported bool
 	jsonSkip bool
 }
@@ -242,7 +367,66 @@ type typeMeta struct {
 
 var typeCache sync.Map
 
+// parseFieldTags extracts optional/required status from struct field tags
+func parseFieldTags(f reflect.StructField, cfg Config) (optional, required, jsonSkip bool) {
+	// JSON tags
+	if jsonTag := f.Tag.Get("json"); jsonTag != "" {
+		parts := strings.Split(jsonTag, ",")
+		if parts[0] == "-" {
+			jsonSkip = true
+			return false, false, true
+		}
+		for _, part := range parts[1:] {
+			if part == "omitempty" {
+				optional = true
+			}
+		}
+	}
+	
+	// YAML tags
+	if yamlTag := f.Tag.Get("yaml"); yamlTag != "" {
+		if strings.Contains(yamlTag, "omitempty") {
+			optional = true
+		}
+	}
+	
+	// Validation tags (required overrides optional)
+	if validateTag := f.Tag.Get("validate"); validateTag != "" {
+		if strings.Contains(validateTag, "required") {
+			required = true
+			optional = false
+		}
+	}
+	
+	// Binding tags (gin, echo, etc.)
+	if bindingTag := f.Tag.Get("binding"); bindingTag != "" {
+		if strings.Contains(bindingTag, "required") {
+			required = true
+			optional = false
+		}
+	}
+	
+	// Protobuf tags
+	if protoTag := f.Tag.Get("protobuf"); protoTag != "" {
+		// proto2 has explicit required keyword
+		if strings.Contains(protoTag, "req") {
+			required = true
+			optional = false
+		}
+	}
+	
+	// Container types (pointers, slices, maps) are implicitly optional
+	if cfg.ContainersOptional && (f.Type.Kind() == reflect.Ptr || 
+	   f.Type.Kind() == reflect.Slice || 
+	   f.Type.Kind() == reflect.Map) {
+		optional = true
+	}
+	
+	return optional, required, jsonSkip
+}
+
 func getTypeMeta(t reflect.Type, cfg Config, allowUnexported bool) *typeMeta {
+	// Dynamic caching - first access is slow (reflection), subsequent are fast
 	if v, ok := typeCache.Load(t); ok {
 		return v.(*typeMeta)
 	}
@@ -256,21 +440,8 @@ func getTypeMeta(t reflect.Type, cfg Config, allowUnexported bool) *typeMeta {
 			continue
 		}
 
-		tag := f.Tag.Get("json")
-		jsonSkip := false
-		omitempty := false
-		if tag != "" {
-			parts := strings.Split(tag, ",")
-			for _, p := range parts {
-				if p == "-" {
-					jsonSkip = true
-					break
-				}
-				if p == "omitempty" {
-					omitempty = true
-				}
-			}
-		}
+		// Use enhanced tag parsing
+		optional, required, jsonSkip := parseFieldTags(f, cfg)
 		if jsonSkip {
 			continue
 		}
@@ -280,7 +451,8 @@ func getTypeMeta(t reflect.Type, cfg Config, allowUnexported bool) *typeMeta {
 			kind:     f.Type.Kind(),
 			typ:      f.Type,
 			isPtr:    f.Type.Kind() == reflect.Ptr,
-			optional: omitempty,
+			optional: optional,
+			required: required,
 			exported: exported,
 			jsonSkip: jsonSkip,
 		}
@@ -291,9 +463,12 @@ func getTypeMeta(t reflect.Type, cfg Config, allowUnexported bool) *typeMeta {
 			fm.elemType = f.Type.Elem()
 			fm.keyType = f.Type.Key()
 		}
+		
+		// ContainersOptional makes all pointer/slice/map fields optional
 		if cfg.ContainersOptional && (fm.isPtr || fm.kind == reflect.Slice || fm.kind == reflect.Map) {
-			fm.optional = true || fm.optional
+			fm.optional = true
 		}
+		
 		m.fields = append(m.fields, fm)
 	}
 	typeCache.Store(t, m)
@@ -513,14 +688,33 @@ func (cf *ConsumeFuzzer) populateStruct(rv reflect.Value, depth int, withCustom 
 	}
 	tm := getTypeMeta(rv.Type(), cf.cfg, cf.allowUnexported)
 
+	// Get a presence bitmap from the pool (if we have optional fields)
+	var presenceBitmap *PresenceBitmap
+	hasOptionalFields := false
+	for _, f := range tm.fields {
+		if f.optional {
+			hasOptionalFields = true
+			break
+		}
+	}
+	
+	if hasOptionalFields && cf.r.Remaining() > 0 {
+		presenceBitmap = presenceBitmapPool.Get().(*PresenceBitmap)
+		defer presenceBitmapPool.Put(presenceBitmap)
+		presenceBitmap.Reset()
+	}
+
 	for _, f := range tm.fields {
 		fv := rv.Field(f.index)
 
 		// Rule 1: presence decision
 		present := true
 		if f.optional {
-			if cf.r.Remaining() > 0 {
-				// one byte presence with bias
+			if presenceBitmap != nil {
+				// Use bitmap: 8x more efficient than reading byte per field
+				present = presenceBitmap.Next(&cf.r)
+			} else if cf.r.Remaining() > 0 {
+				// Fallback: one byte presence with bias (old method)
 				b, _ := cf.r.ReadByte()
 				den := cf.cfg.OptionalPresentDenom
 				num := cf.cfg.OptionalPresentNum
@@ -637,12 +831,17 @@ func (cf *ConsumeFuzzer) populateSlice(fv reflect.Value, f fieldMeta, depth int,
 	if depth >= cf.cfg.MaxDepth || cf.r.Remaining() == 0 {
 		return
 	}
-	n, ok := cf.r.ReadLen(minInt(cf.cfg.MaxSliceLen, 255))
-	if !ok || n <= 0 {
-		return
-	}
-	// Fast path for []byte
+	
+	// Fast path for []byte: use MaxByteSliceLen
 	if f.elemType.Kind() == reflect.Uint8 {
+		maxLen := cf.cfg.MaxByteSliceLen
+		if maxLen == 0 {
+			maxLen = cf.cfg.MaxSliceLen // fallback to MaxSliceLen if not set
+		}
+		n, ok := cf.r.ReadLen(minInt(maxLen, 65535)) // Allow up to 64KB for binary data
+		if !ok || n <= 0 {
+			return
+		}
 		if cf.r.Remaining() < n {
 			return
 		}
@@ -653,6 +852,12 @@ func (cf *ConsumeFuzzer) populateSlice(fv reflect.Value, f fieldMeta, depth int,
 		out := make([]byte, n)
 		copy(out, bs)
 		fv.SetBytes(out)
+		return
+	}
+	
+	// Normal slices: use MaxSliceLen
+	n, ok := cf.r.ReadLen(minInt(cf.cfg.MaxSliceLen, 255))
+	if !ok || n <= 0 {
 		return
 	}
 	s := reflect.MakeSlice(f.typ, n, n)
@@ -693,12 +898,36 @@ func (cf *ConsumeFuzzer) populateValue(v reflect.Value, depth int, withCustom bo
 			v.SetBool(b)
 		}
 
-	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+	case reflect.Int8:
+		if b, ok := cf.r.ReadByte(); ok {
+			v.SetInt(int64(int8(b)))
+		}
+	case reflect.Int16:
+		if u, ok := cf.r.ReadUint16LE(); ok {
+			v.SetInt(int64(int16(u)))
+		}
+	case reflect.Int32:
+		if u, ok := cf.r.ReadUint32LE(); ok {
+			v.SetInt(int64(int32(u)))
+		}
+	case reflect.Int, reflect.Int64:
 		if u, ok := cf.r.ReadUint64LE(); ok {
 			setIntClamp(v, int64(u))
 		}
 
-	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+	case reflect.Uint8:
+		if b, ok := cf.r.ReadByte(); ok {
+			v.SetUint(uint64(b))
+		}
+	case reflect.Uint16:
+		if u, ok := cf.r.ReadUint16LE(); ok {
+			v.SetUint(uint64(u))
+		}
+	case reflect.Uint32:
+		if u, ok := cf.r.ReadUint32LE(); ok {
+			v.SetUint(uint64(u))
+		}
+	case reflect.Uint, reflect.Uint64, reflect.Uintptr:
 		if u, ok := cf.r.ReadUint64LE(); ok {
 			setUintClamp(v, u)
 		}
